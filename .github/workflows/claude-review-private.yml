@@ -16,10 +16,16 @@
 # SECURITY:
 #   - payload validation: pr_number must be numeric, SHAs must be hex-40
 #     (client_payload values never reach a shell unsanitized).
-#   - READ-ONLY deploy keys for git (clone/fetch only — a leaked key cannot
-#     push anything anywhere); PAT only for the final review POST.
-#   - keys shredded (trap) before the review agent step; the review agent
-#     runs --permission-mode plan (no writes, no command execution).
+#   - TASK-40 PORT: org repos reject deploy keys (new-org 2025 default:
+#     "Deploy keys are disabled for this repository" — UI-only toggle in
+#     Org Settings > Member privileges). Git transport for the org main repo
+#     is therefore PAT-HTTPS via GIT_CONFIG_* env (never written to disk,
+#     never visible to other steps, dies with the step). The KIT clone keeps
+#     its read-only deploy key (the kit lives in the personal account, which
+#     still accepts keys). PAT auth for git is confined to this clone step;
+#     the review agent step runs with NO credentials (kit key shredded, PAT
+#     env gone). Operator hardening options recorded in HANDOFF §7.
+#   - review agent runs --permission-mode plan (no writes, no execution).
 #   - trigger: repository_dispatch (owner-only actors can send it).
 #   - failure is never silent: a failure-signal comment lands on the private PR.
 name: Claude Review Private (public compute)
@@ -54,27 +60,21 @@ jobs:
           [ "$ok" = "1" ] || exit 1
           echo "reviewing PR #$PR_NUMBER base=${BASE_SHA:0:7} head=${HEAD_SHA:0:7}"
 
-      - name: Clone private repo at the PR merge ref (RO keys, shredded after)
+      - name: Clone private repo at the PR merge ref (PAT-HTTPS + kit RO key, shredded after)
         env:
-          DK_RO: ${{ secrets.DEPLOY_KEY_REVIEW_RO }}
+          GH_PAT_PRIVATE: ${{ secrets.GH_PAT_PRIVATE }}
           DK_KIT_RO: ${{ secrets.DEPLOY_KEY_KIT_RO }}
           PR_NUMBER: ${{ github.event.client_payload.pr_number }}
           HEAD_SHA: ${{ github.event.client_payload.head_sha }}
           BASE_SHA: ${{ github.event.client_payload.base_sha }}
         run: |
           mkdir -p ~/.ssh
-          printf '%s\n' "$DK_RO"    > ~/.ssh/id_ro
           printf '%s\n' "$DK_KIT_RO" > ~/.ssh/id_kit_ro
-          chmod 600 ~/.ssh/id_ro ~/.ssh/id_kit_ro
+          chmod 600 ~/.ssh/id_kit_ro
           # unconditional shred on any exit path
-          trap 'rm -f ~/.ssh/id_ro ~/.ssh/id_kit_ro' EXIT
+          trap 'rm -f ~/.ssh/id_kit_ro' EXIT
           ssh-keyscan -t ed25519 github.com > ~/.ssh/known_hosts 2>/dev/null
           cat > ~/.ssh/config <<'CFG'
-          Host gh-private
-            HostName github.com
-            User git
-            IdentityFile ~/.ssh/id_ro
-            IdentitiesOnly yes
           Host gh-kit
             HostName github.com
             User git
@@ -83,10 +83,16 @@ jobs:
           CFG
           git config --global url."git@gh-kit:xfnwfpho1/claudecode-zai-agent-kit.git".insteadOf \
             "https://github.com/xfnwfpho1/claudecode-zai-agent-kit.git"
+          # PAT-HTTPS transport for the org main repo: env-based insteadOf
+          # rewrite (no disk writes, step-scoped; more specific kit rule
+          # above still wins for kit URLs — longest-prefix insteadOf match)
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${GH_PAT_PRIVATE}@github.com/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://github.com/"
           # sanitized clone: single-branch only (agent-sessions corpus must
           # not ride along as refs)
           git clone --no-checkout --single-branch \
-            git@gh-private:claudecode-headless/cc-gha-exploration.git repo
+            https://github.com/claudecode-headless/cc-gha-exploration.git repo
           cd repo
           # THE MERGE REF (server-computed post-merge result — the same ref
           # actions/checkout uses for pull_request events): review what the PR
@@ -113,7 +119,7 @@ jobs:
           DEL=$(git diff --numstat "$MERGE_BASE" "$MERGE_HEAD" | awk '{s+=$2} END {print s+0}')
           echo "diff aggregate: ${FILES} files, +${INS}/-${DEL} lines"
           # shred BEFORE the agent step (trap already covers failures)
-          rm -f ~/.ssh/id_ro ~/.ssh/id_kit_ro
+          rm -f ~/.ssh/id_kit_ro   # PAT auth was env-only (GIT_CONFIG_*) — already gone with the clone step
           trap - EXIT
 
       - name: Install Claude Code

@@ -1,63 +1,88 @@
-name: deploy-key-smoke
+name: transport-smoke
+# TASK-40 PORT: deploy keys are rejected by org repos ("Deploy keys are
+# disabled for this repository" — new-org 2025 default, UI-only toggle).
+# This smoke now proves BOTH surviving git transports of the ported world:
+#   PROOF 1: PAT-HTTPS clone of the org main repo (GIT_CONFIG_* env rewrite)
+#   PROOF 2: PAT-HTTPS push surface (branch probe, force-cleaned after)
+#   PROOF 3: kit deploy-key SSH clone (the kit lives in the personal account)
+#   PROOF 4: unauthenticated REST invisibility of the private repo
+# If the org toggle is ever flipped ON (Org Settings > Member privileges >
+# Deploy keys), DEPLOY_KEY_PRIVATE/REVIEW_RO can return — see HANDOFF §7.
 on:
   workflow_dispatch:
 
 permissions: {}
 
 jobs:
-  deploy-key-proofs:
+  transport-proofs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Configure SSH from deploy key secret
+      - name: "PROOF 1: PAT-HTTPS clone of the org main repo (env-based auth, no disk)"
         env:
-          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY_PRIVATE }}
+          GH_PAT_PRIVATE: ${{ secrets.GH_PAT_PRIVATE }}
         run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          # model the shred discipline the ports use (no agent step here, but
-          # this file is the reference implementation)
-          trap 'rm -f ~/.ssh/id_ed25519' EXIT
-          ssh-keyscan -t ed25519 github.com > ~/.ssh/known_hosts 2>/dev/null
-          ssh-keygen -lf ~/.ssh/id_ed25519 || true
-
-      - name: "PROOF 1: SSH clone of the private repo via deploy key (no PAT)"
-        run: |
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${GH_PAT_PRIVATE}@github.com/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://github.com/"
           git clone --depth 5 --single-branch --branch main \
-            git@github.com:claudecode-headless/cc-gha-exploration.git private-repo
+            https://github.com/claudecode-headless/cc-gha-exploration.git private-repo
           cd private-repo
           echo "cloned OK; HEAD: $(git rev-parse HEAD)"
           echo "file count at HEAD: $(git ls-tree -r HEAD --name-only | wc -l)"
+          # the remote URL stays CLEAN (PAT never reaches .git/config)
+          echo "origin URL: $(git remote get-url origin)"
 
-      - name: "PROOF 2: SSH push (git write surface) — branch off HEAD, force-push reset"
+      - name: "PROOF 2: PAT-HTTPS push surface — branch off HEAD, self-cleaning"
+        env:
+          GH_PAT_PRIVATE: ${{ secrets.GH_PAT_PRIVATE }}
         run: |
           cd private-repo
-          git config user.name "executor-deploy-key"
+          git config user.name "executor-transport-probe"
           git config user.email "executor@users.noreply.github.com"
-          git checkout -B executor-deploy-key-probe
-          echo "deploy-key write probe $(date -u +%FT%TZ)" >> .deploy-key-write-probe
-          git add .deploy-key-write-probe
-          git commit -q -m "probe: deploy-key write path (auto-cleaning)"
-          git push -q origin executor-deploy-key-probe
-          echo "push OK; remote now has branch executor-deploy-key-probe"
+          git checkout -B executor-transport-probe
+          echo "pat-https write probe $(date -u +%FT%TZ)" >> .transport-write-probe
+          git add .transport-write-probe
+          git commit -q -m "probe: PAT-HTTPS write path (auto-cleaning)"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${GH_PAT_PRIVATE}@github.com/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://github.com/"
+          git push -q origin executor-transport-probe
+          echo "push OK; remote now has branch executor-transport-probe"
           # cleanup: delete the probe branch remotely to keep the repo tidy
-          git push -q origin --delete executor-deploy-key-probe
+          git push -q origin --delete executor-transport-probe
           echo "probe branch deleted; write surface proven (clone+commit+push+delete-branch)"
 
-      - name: "PROOF 3: deploy key CANNOT call the REST API (scoping boundary)"
+      - name: "PROOF 3: kit deploy-key SSH clone (personal-account repo still accepts keys)"
+        env:
+          DK_KIT_RO: ${{ secrets.DEPLOY_KEY_KIT_RO }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DK_KIT_RO" > ~/.ssh/id_kit_ro
+          chmod 600 ~/.ssh/id_kit_ro
+          trap 'rm -f ~/.ssh/id_kit_ro' EXIT
+          ssh-keyscan -t ed25519 github.com > ~/.ssh/known_hosts 2>/dev/null
+          cat > ~/.ssh/config <<'CFG'
+          Host gh-kit
+            HostName github.com
+            User git
+            IdentityFile ~/.ssh/id_kit_ro
+            IdentitiesOnly yes
+          CFG
+          git clone --depth 1 --single-branch \
+            git@gh-kit:xfnwfpho1/claudecode-zai-agent-kit.git kit-repo
+          echo "kit cloned OK; HEAD: $(git -C kit-repo rev-parse HEAD)"
+
+      - name: "PROOF 4: unauthenticated API cannot see the private repo (boundary)"
         run: |
           set +e
-          # no PAT in env in this job — only the deploy key exists. API access via SSH key is impossible by design;
-          # demonstrate by attempting an authenticated REST call with no token at all:
           code=$(curl -s -o /dev/null -w '%{http_code}' \
             https://api.github.com/repos/claudecode-headless/cc-gha-exploration)
-          echo "unauthenticated API read of the private repo: HTTP $code (404 expected — private repo is invisible without a token)"
+          echo "unauthenticated API read of the org private repo: HTTP $code (404 expected — invisible without a token)"
           test "$code" = "404"
 
-      - name: "PROOF 4: zero private-repo minutes consumed by this job"
+      - name: "PROOF 5: zero private-repo minutes consumed by this job"
         run: |
-          echo "This job ran on the PUBLIC executor (free/unlimited). The only private-repo
-          cost would be any runs triggered there — this job triggers none (SSH git ops
-          create no workflow events; push events on non-default branches with no
-          matching workflow cost nothing)."
+          echo "This job ran on the PUBLIC executor (free/unlimited). The only org-repo
+          cost would be runs triggered there — this job triggers none (HTTPS git ops
+          on branches create no workflow events; no workflow on main listens to them)."

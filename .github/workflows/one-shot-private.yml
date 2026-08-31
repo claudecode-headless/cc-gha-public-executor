@@ -68,9 +68,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Clone private repo + restore session state (keys live only in this step)
+      - name: Clone private repo + restore session state (credentials live only in this step)
         env:
-          DK_PRIVATE: ${{ secrets.DEPLOY_KEY_PRIVATE }}
+          GH_PAT_PRIVATE: ${{ secrets.GH_PAT_PRIVATE }}
           DK_KIT: ${{ secrets.DEPLOY_KEY_KIT_RO }}
           RESUME_SID: ${{ github.event.inputs.resume_session_id }}
           BRANCH: ${{ github.event.inputs.branch }}
@@ -79,21 +79,17 @@ jobs:
           if ! printf '%s' "${BRANCH:-main}" | grep -Eq '^[A-Za-z0-9._/-]+$'; then
             echo "::error::branch must match ^[A-Za-z0-9._/-]+$" >&2; exit 1
           fi
-          # --- ssh: one key per host alias (SSH picks the key before the repo
-          # path is known, so two github.com identities need two aliases)
+          # --- TASK-40 PORT: org repos reject deploy keys (new-org 2025
+          # default). Main-repo transport = PAT-HTTPS via GIT_CONFIG_* env
+          # (step-scoped, no disk writes); kit clone keeps its RO deploy key
+          # via the gh-kit SSH alias (kit lives in the personal account).
           mkdir -p ~/.ssh
-          printf '%s\n' "$DK_PRIVATE" > ~/.ssh/id_private
           printf '%s\n' "$DK_KIT"      > ~/.ssh/id_kit
-          chmod 600 ~/.ssh/id_private ~/.ssh/id_kit
+          chmod 600 ~/.ssh/id_kit
           # UNCONDITIONAL shred: any failure below aborts with keys already gone
-          trap 'rm -f ~/.ssh/id_private ~/.ssh/id_kit' EXIT
+          trap 'rm -f ~/.ssh/id_kit' EXIT
           ssh-keyscan -t ed25519 github.com > ~/.ssh/known_hosts 2>/dev/null
           cat > ~/.ssh/config <<'CFG'
-          Host gh-private
-            HostName github.com
-            User git
-            IdentityFile ~/.ssh/id_private
-            IdentitiesOnly yes
           Host gh-kit
             HostName github.com
             User git
@@ -102,6 +98,11 @@ jobs:
           CFG
           git config --global url."git@gh-kit:xfnwfpho1/claudecode-zai-agent-kit.git".insteadOf \
             "https://github.com/xfnwfpho1/claudecode-zai-agent-kit.git"
+          # PAT-HTTPS rewrite for the org main repo (env-based: more specific
+          # kit rule above still wins for kit URLs — longest-prefix match)
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${GH_PAT_PRIVATE}@github.com/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://github.com/"
 
           # --- clone (sanitized single-branch). FIXED PATH mirrors the private
           # runner's workspace (/home/runner/work/<repo>/<repo>) so the encoded
@@ -109,7 +110,7 @@ jobs:
           # (private one-shot <-> executor) instead of failing cwd resolution.
           WORK=/home/runner/work/cc-gha-exploration/cc-gha-exploration
           git clone --single-branch --branch "${BRANCH:-main}" \
-            git@gh-private:claudecode-headless/cc-gha-exploration.git "$WORK"
+            https://github.com/claudecode-headless/cc-gha-exploration.git "$WORK"
           cd "$WORK"
           git submodule update --init
           echo "cloned: $(git rev-parse --short HEAD) ($(git ls-tree -r HEAD --name-only | wc -l) files)"
@@ -151,11 +152,12 @@ jobs:
             echo "resume target verified: ${RESUME_SID}.jsonl"
           fi
 
-          # --- SHRED the keys (trap also fires on any failure above): the agent
-          # step below runs with bypassPermissions and must not read them.
-          rm -f ~/.ssh/id_private ~/.ssh/id_kit
+          # --- SHRED the credentials (trap also fires on any failure above): the
+          # agent step below runs with bypassPermissions and must not read them.
+          # PAT was env-only (GIT_CONFIG_*) — gone with this step's shell.
+          rm -f ~/.ssh/id_kit
           trap - EXIT
-          echo "deploy keys shredded; agent will run without git credentials"
+          echo "kit key shredded; agent will run without git credentials (PAT was step-env only)"
 
       - name: Install Claude Code
         env:
@@ -218,10 +220,10 @@ jobs:
           # opaque usage metadata only (no prompt/response content)
           jq '{session_id, subtype, is_error, num_turns, duration_ms, usage: {input_tokens: .usage.input_tokens, output_tokens: .usage.output_tokens, cache_read_input_tokens: .usage.cache_read_input_tokens}}' /tmp/result.json
 
-      - name: Persist session state to the PRIVATE repo (keys re-materialized, shredded after)
+      - name: Persist session state to the PRIVATE repo (PAT re-scoped to this step, shredded after)
         if: always()
         env:
-          DK_PRIVATE: ${{ secrets.DEPLOY_KEY_PRIVATE }}
+          GH_PAT_PRIVATE: ${{ secrets.GH_PAT_PRIVATE }}
           SESSION_ID: ${{ steps.agent.outputs.SESSION_ID }}
           RUN_ID: ${{ github.run_id }}
           RESTORE_SHA: ${{ env.RESTORE_SHA }}
@@ -237,30 +239,16 @@ jobs:
           #   GIT_CONFIG_GLOBAL/SYSTEM=/dev/null -> ignores a rewritten ~/.gitconfig
           #     (e.g. url.<attacker>.insteadOf re-routing our push)
           #   core.hooksPath=/dev/null + --no-verify -> ignores planted .git/hooks/*
-          #   GIT_SSH_COMMAND with -F /dev/null -> ignores a rewritten ~/.ssh/config
-          #     (e.g. ProxyCommand exfil); fresh known_hosts + StrictHostKeyChecking
           #   remote URL assert -> the push target is exactly what we cloned
-          printf '%s\n' "$DK_PRIVATE" > /tmp/persist_key
-          chmod 600 /tmp/persist_key
-          ssh-keyscan -t ed25519 github.com > /tmp/persist_known_hosts 2>/dev/null
+          # TASK-40 PORT: auth for the push = GIT_CONFIG_* env vars (survive
+          # GIT_CONFIG_GLOBAL=/dev/null by design — env config outranks
+          # nothing but command-line -c; never written to disk, so the agent
+          # could not have planted or read them).
           export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
-          # FRESH ssh config at an unguessable mktemp path: carries the gh-private
-          # host-alias mapping (a bare -F /dev/null would break alias resolution —
-          # live-caught run 33144031287: push exit 128) while still ignoring the
-          # agent-writable ~/.ssh/config
-          SSHCFG=$(mktemp /tmp/persist-ssh.XXXXXX)
-          cat > "$SSHCFG" <<'SSSCFG'
-          Host gh-private
-            HostName github.com
-            User git
-            IdentityFile /tmp/persist_key
-            IdentitiesOnly yes
-            StrictHostKeyChecking yes
-            UserKnownHostsFile /tmp/persist_known_hosts
-          SSSCFG
-          export GIT_SSH_COMMAND="ssh -F $SSHCFG"
-          trap 'rm -f /tmp/persist_key $SSHCFG' EXIT
-          EXPECTED_URL="git@gh-private:claudecode-headless/cc-gha-exploration.git"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${GH_PAT_PRIVATE}@github.com/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://github.com/"
+          EXPECTED_URL="https://github.com/claudecode-headless/cc-gha-exploration.git"
           ACTUAL_URL=$(git remote get-url origin)
           if [ "$ACTUAL_URL" != "$EXPECTED_URL" ]; then
             echo "::error::origin URL differs from the clone-time value — refusing to push" >&2
