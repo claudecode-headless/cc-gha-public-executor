@@ -59,21 +59,41 @@ GQL() { # GQL <payload-json> → GraphQL response on stdout; empty string on tra
 }
 
 # ---------- 0. capability gate (the graceful-skip contract) ----------
-PROBE=$(GQL "{\"query\": \"query { user(login: \\\"${PRIVATE_REPO%%/*}\\\") { projectV2(number: ${BOARD_NUMBER}) { id title } } }\"}")
-if [ -z "$PROBE" ]; then
+# TASK-40 PORT: the swarm home is an ORG (claudecode-headless). An org login
+# under user() returns null data (not an error) — the original user()-only
+# probe would self-install a DUPLICATE board under the viewer EVERY cycle.
+# Probe the org first; fall back to user for personal-account repos; self-
+# install under the org when the repo is org-owned (else the viewer).
+REPO_OWNER=${PRIVATE_REPO%%/*}
+ORG_PROBE=$(GQL "{\"query\": \"query { organization(login: \\\"${REPO_OWNER}\\\") { id projectV2(number: ${BOARD_NUMBER}) { id title } } }\"}")
+USER_PROBE=$(GQL "{\"query\": \"query { user(login: \\\"${REPO_OWNER}\\\") { id projectV2(number: ${BOARD_NUMBER}) { id title } } }\"}")
+if [ -z "$ORG_PROBE" ] && [ -z "$USER_PROBE" ]; then
   echo "board sync: SKIPPED — board probe returned nothing (transport). Scheduler continues normally."
   exit 0
 fi
-if printf '%s' "$PROBE" | jq -e '.errors[]? | select(.type=="INSUFFICIENT_SCOPES")' >/dev/null 2>&1; then
-  echo "board sync: SKIPPED — token lacks the project scope (audited state; add BOARD_PAT to activate). Scheduler continues normally."
-  exit 0
+for P in "$ORG_PROBE" "$USER_PROBE"; do
+  if printf '%s' "$P" | jq -e '.errors[]? | select(.type=="INSUFFICIENT_SCOPES")' >/dev/null 2>&1; then
+    echo "board sync: SKIPPED — token lacks the project scope (audited state; add BOARD_PAT to activate). Scheduler continues normally."
+    exit 0
+  fi
+done
+ORG_ID=$(printf '%s' "$ORG_PROBE" | jq -r '.data.organization.id // empty' 2>/dev/null || true)
+if [ -n "$ORG_ID" ]; then
+  PROBE="$ORG_PROBE"
+  PROJECT_ID=$(printf '%s' "$PROBE" | jq -r '.data.organization.projectV2.id // empty' 2>/dev/null || true)
+else
+  PROBE="$USER_PROBE"
+  PROJECT_ID=$(printf '%s' "$PROBE" | jq -r '.data.user.projectV2.id // empty' 2>/dev/null || true)
 fi
-PROJECT_ID=$(printf '%s' "$PROBE" | jq -r '.data.user.projectV2.id // empty' 2>/dev/null || true)
 if [ -z "$PROJECT_ID" ]; then
   echo "board sync: board #${BOARD_NUMBER} not found — creating it (self-install)."
-  VIEWER=$(GQL '{"query": "query { viewer { id } }"}')
-  OWNER_ID=$(printf '%s' "$VIEWER" | jq -r '.data.viewer.id // empty' 2>/dev/null || true)
-  if [ -z "$OWNER_ID" ]; then echo "board sync: viewer id unavailable — skipping this cycle." >&2; exit 0; fi
+  if [ -n "$ORG_ID" ]; then
+    OWNER_ID="$ORG_ID"   # org-owned repo: the board lives with the org
+  else
+    VIEWER=$(GQL '{"query": "query { viewer { id } }"}')
+    OWNER_ID=$(printf '%s' "$VIEWER" | jq -r '.data.viewer.id // empty' 2>/dev/null || true)
+  fi
+  if [ -z "$OWNER_ID" ]; then echo "board sync: owner/viewer id unavailable — skipping this cycle." >&2; exit 0; fi
   CREATE=$(GQL "{\"query\": \"mutation(\$o: ID!, \$t: String!) { createProjectV2(input: {ownerId: \$o, title: \$t}) { projectV2 { id } } }\", \"variables\": {\"o\": \"${OWNER_ID}\", \"t\": \"${BOARD_TITLE}\"}}")
   PROJECT_ID=$(printf '%s' "$CREATE" | jq -r '.data.createProjectV2.projectV2.id // empty' 2>/dev/null || true)
   [ -n "$PROJECT_ID" ] || { echo "board sync: createProjectV2 failed — skipping this cycle." >&2; exit 0; }
