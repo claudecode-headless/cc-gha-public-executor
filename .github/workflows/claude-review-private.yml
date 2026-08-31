@@ -86,7 +86,7 @@ jobs:
           # sanitized clone: single-branch only (agent-sessions corpus must
           # not ride along as refs)
           git clone --no-checkout --single-branch \
-            git@gh-private:xfnwfpho1/cc-gha-exploration.git repo
+            git@gh-private:claudecode-headless/cc-gha-exploration.git repo
           cd repo
           # THE MERGE REF (server-computed post-merge result — the same ref
           # actions/checkout uses for pull_request events): review what the PR
@@ -179,7 +179,7 @@ jobs:
               print("empty review — not posting"); raise SystemExit(0)
           body = {"body": f"**Claude review (public-compute executor)** — head `{os.environ['HEAD_SHA'][:7]}`\n\n{review}", "event": "COMMENT"}
           req = urllib.request.Request(
-              f"https://api.github.com/repos/xfnwfpho1/cc-gha-exploration/pulls/{pr}/reviews",
+              f"https://api.github.com/repos/claudecode-headless/cc-gha-exploration/pulls/{pr}/reviews",
               method="POST",
               headers={"Authorization": f"token {pat}", "Accept": "application/vnd.github+json",
                        "Content-Type": "application/json"},
@@ -218,7 +218,7 @@ jobs:
                           "No automated review was produced — check the executor run log (metadata only), re-dispatch, "
                           "or re-enable the private claude-review.yml fallback."}
           req = urllib.request.Request(
-              f"https://api.github.com/repos/xfnwfpho1/cc-gha-exploration/issues/{pr}/comments",
+              f"https://api.github.com/repos/claudecode-headless/cc-gha-exploration/issues/{pr}/comments",
               method="POST",
               headers={"Authorization": f"token {pat}", "Accept": "application/vnd.github+json",
                        "Content-Type": "application/json"},

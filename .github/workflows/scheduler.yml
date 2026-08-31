@@ -62,7 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      PRIVATE_REPO: xfnwfpho1/cc-gha-exploration
+      PRIVATE_REPO: claudecode-headless/cc-gha-exploration
       GH_PAGER: ""
     steps:
       # SHA-pinned (a moved v4 tag would otherwise run with no PAT but still
@@ -245,7 +245,7 @@ jobs:
           GH_PAT_PRIVATE: ${{ secrets.GH_PAT_PRIVATE }}
           BOARD_PAT: ${{ secrets.BOARD_PAT }}   # optional project-scoped override
           GH_TOKEN: ${{ secrets.GH_PAT_PRIVATE }}  # for the REST node-id lookups inside the script (review 36-r1 P1: without it, board ADDS can never succeed)
-          PRIVATE_REPO: xfnwfpho1/cc-gha-exploration
+          PRIVATE_REPO: claudecode-headless/cc-gha-exploration
           ROSTER: ${{ steps.scan.outputs.roster }}    # live roster (no registry drift)
         run: bash scripts/board-sync.sh /tmp/board-state.jsonl /tmp/scanned-issues
 

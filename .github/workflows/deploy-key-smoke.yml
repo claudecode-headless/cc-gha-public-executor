@@ -25,7 +25,7 @@ jobs:
       - name: "PROOF 1: SSH clone of the private repo via deploy key (no PAT)"
         run: |
           git clone --depth 5 --single-branch --branch main \
-            git@github.com:xfnwfpho1/cc-gha-exploration.git private-repo
+            git@github.com:claudecode-headless/cc-gha-exploration.git private-repo
           cd private-repo
           echo "cloned OK; HEAD: $(git rev-parse HEAD)"
           echo "file count at HEAD: $(git ls-tree -r HEAD --name-only | wc -l)"
@@ -51,7 +51,7 @@ jobs:
           # no PAT in env in this job — only the deploy key exists. API access via SSH key is impossible by design;
           # demonstrate by attempting an authenticated REST call with no token at all:
           code=$(curl -s -o /dev/null -w '%{http_code}' \
-            https://api.github.com/repos/xfnwfpho1/cc-gha-exploration)
+            https://api.github.com/repos/claudecode-headless/cc-gha-exploration)
           echo "unauthenticated API read of the private repo: HTTP $code (404 expected — private repo is invisible without a token)"
           test "$code" = "404"
 

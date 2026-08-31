@@ -41,12 +41,12 @@ jobs:
         run: |
           set -e
           echo "3. Authenticating to the PRIVATE repo with the PAT secret:"
-          PRIV=$(gh api repos/xfnwfpho1/cc-gha-exploration --jq '.private')
+          PRIV=$(gh api repos/claudecode-headless/cc-gha-exploration --jq '.private')
           echo "   private repo reachable: private=${PRIV}"
           [ "$PRIV" = "true" ] || { echo "::error::expected the target repo to be private"; exit 1; }
           echo "4. PAT can drive the private control plane (dispatching the 5-second"
           echo "   schedule-probe workflow — proving authenticated cross-repo execution):"
-          gh workflow run schedule-probe.yml -R xfnwfpho1/cc-gha-exploration
+          gh workflow run schedule-probe.yml -R claudecode-headless/cc-gha-exploration
           echo "   dispatch accepted"
 
       - name: Public-compute economics proof

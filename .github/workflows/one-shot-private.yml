@@ -109,7 +109,7 @@ jobs:
           # (private one-shot <-> executor) instead of failing cwd resolution.
           WORK=/home/runner/work/cc-gha-exploration/cc-gha-exploration
           git clone --single-branch --branch "${BRANCH:-main}" \
-            git@gh-private:xfnwfpho1/cc-gha-exploration.git "$WORK"
+            git@gh-private:claudecode-headless/cc-gha-exploration.git "$WORK"
           cd "$WORK"
           git submodule update --init
           echo "cloned: $(git rev-parse --short HEAD) ($(git ls-tree -r HEAD --name-only | wc -l) files)"
@@ -260,7 +260,7 @@ jobs:
           SSSCFG
           export GIT_SSH_COMMAND="ssh -F $SSHCFG"
           trap 'rm -f /tmp/persist_key $SSHCFG' EXIT
-          EXPECTED_URL="git@gh-private:xfnwfpho1/cc-gha-exploration.git"
+          EXPECTED_URL="git@gh-private:claudecode-headless/cc-gha-exploration.git"
           ACTUAL_URL=$(git remote get-url origin)
           if [ "$ACTUAL_URL" != "$EXPECTED_URL" ]; then
             echo "::error::origin URL differs from the clone-time value — refusing to push" >&2
