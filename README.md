@@ -50,6 +50,57 @@ repo's open issues via PAT → dispatch the private lead sweep **only when a
 stall is actually detected**. Private quota is spent on real work, not
 monitoring cadence.
 
+### 3. Duty roster + the two new duties (Task 45)
+
+The daemon is now a data-driven DUTY ROSTER loop. The roster is fetched LIVE
+from the private swarm repo at `.github/roster/repos.json` (same pattern as
+`registry.json` — keeps private repo names out of this public source). Fetch
+failure → **DEGRADED mode**: the legacy single-repo duties keep running, a loud
+`::error` is logged, and one alert comment/day lands on the executor's own
+`exec-duty-alert` issue — never a total-abort blackout.
+
+New duties (each independently `always()`-gated; alert issues are latches —
+closing one re-arms the lane):
+
+- **fsm-watchdog** — dumb driver for `claudecode-headless/fsm-lab`: reads
+  state.json, skips on halted/paused/fresh/in-flight, dispatches the in-repo
+  watchdog WORKFLOW via `workflow_dispatch` (the watchdog keeps ALL brains;
+  zero fsm-lab code changes), 204-verifies run visibility (10s WARN → 120s
+  re-check), and carries a stateless re-prime soft-cap latch (8/6h).
+- **mirror-health** — two-class verdict (SILENCE: private status ledger silent
+  >26h / RED: ≥6 consecutive non-success mirror-runner runs) with
+  transition-only comments and 24h-deduped alerts.
+- **duty-health** — per-cycle `/user` canaries on the PATs this workflow holds
+  (canary failure = WARNING + alert issue, never a job failure) + scope-drift
+  check + board-sync skip marker.
+
+Runtime switches (repo vars, no commit needed; resolution `off > dry > on`):
+`EXEC_DUTY_MODE` (global kill/dry), `EXEC_DUTY_ROSTER` (`off` = byte-exact
+legacy path), and per-duty `EXEC_STALL_SCAN`, `EXEC_FAILURE_WATCH`,
+`EXEC_BOARD_SYNC`, `EXEC_QUOTA_TELEMETRY`, `EXEC_FSM_WATCHDOG`,
+`EXEC_MIRROR_HEALTH`, `EXEC_PINGER`. The roster itself can also mark a duty
+`"dry": true` (per entry) — the fsm-watchdog entry ships dry-by-default, so
+going live is an explicit `EXEC_FSM_WATCHDOG=on` flip, never an accident.
+Legacy duty granularity is real: stall-scan and failure-watch are gated
+independently inside the monitor scan (fail-open — a roster-step hiccup
+never disables them). Helpers live in `scripts/exec-duty-lib.sh`
+(alert-latch primitives shared by all duties).
+
+The roster file itself is OPERATOR-EDITED DATA (private swarm repo,
+`.github/roster/repos.json`, schema v1) — adding a monitored repo or duty
+never touches this repo's code. Slugs of private repos live ONLY in that
+private file. Key fields: `stale_after_min` (fsm staleness threshold, 10),
+`dry: true` on an entry (lands the duty dry-by-default), `silence_after_h` /
+`fail_streak` (mirror-health verdicts), `reprime_softcap`/`reprime_window_h`
+(the 8/6h soft-cap latch), `verify_wait_s`/`verify_window_s` (the 204-verify
+10s/120s window). Alert issues opened by the duties on THIS repo (label
+`exec-duty-alert`; one OPEN issue per class = a latch, closing it re-arms
+the lane; bodies carry the 24h-dedup `[exec-duty]` marker):
+`duty alert: roster degraded`, `duty alert: mirror-health`,
+`duty alert: fsm re-prime storm`, `duty alert: credential dead (C1)`,
+`duty alert: credential dead (B1)`, `duty alert: board-sync degraded`,
+`duty alert: pinger silent`.
+
 ## Security model (READ BEFORE ADDING ANY TRIGGER)
 
 This is a **public** repo. Every workflow run, its logs, and its artifacts are

@@ -32,7 +32,15 @@ set -euo pipefail
 STATE_FILE=${1:?usage: board-sync.sh <state-file.jsonl> [scanned-issues-file]}
 SCANNED_FILE=${2:-}   # issues confirmed scanned this pass (removal guard — see below)
 PRIVATE_REPO=${PRIVATE_REPO:?}
-ROSTER=${ROSTER:?}                  # comma-separated agent ids (registry-driven)
+# ROSTER comes from the monitor scan's registry fetch (live, no drift). Empty
+# or unset = the scan step was SKIPPED this cycle (both scan duties gated off
+# via roster/vars) or produced no output — the board never justifies a red
+# step (the graceful-skip contract; Task 45 roster gating).
+ROSTER=${ROSTER:-}
+if [ -z "$ROSTER" ]; then
+  echo "board sync: SKIPPED — no agent roster this cycle (monitor scan off/unavailable). Scheduler continues normally."
+  exit 0
+fi
 BOARD_NUMBER=${BOARD_NUMBER:-1}     # the "A2A Swarm Board" user project
 BOARD_TITLE=${BOARD_TITLE:-A2A Swarm Board}
 # BOARD_PAT (project-scoped) overrides GH_PAT_PRIVATE when present.
@@ -74,6 +82,10 @@ fi
 for P in "$ORG_PROBE" "$USER_PROBE"; do
   if printf '%s' "$P" | jq -e '.errors[]? | select(.type=="INSUFFICIENT_SCOPES")' >/dev/null 2>&1; then
     echo "board sync: SKIPPED — token lacks the project scope (audited state; add BOARD_PAT to activate). Scheduler continues normally."
+    # capability-skip marker for the scheduler's duty-health step (Task 45):
+    # scope loss is the SILENT degradation class — /user canaries stay green
+    # while the board quietly goes stale, so the skip path itself must signal.
+    touch /tmp/board-skip 2>/dev/null || true
     exit 0
   fi
 done

@@ -31,6 +31,32 @@
 #   4. QUOTA TELEMETRY (new): a monthly private-minutes estimate line
 #      (wall-clock sum of recent runs — a trend indicator, not billing).
 #
+# Task 45 extension (research/PHASE1-EXECUTOR-EXTENSION.md + R3 amendments) —
+# the daemon becomes a data-driven DUTY ROSTER loop (roster fetched LIVE from
+# the private swarm repo like registry.json; fetch failure = DEGRADED mode:
+# legacy single-repo duties only + a loud log + one alert comment/day — NEVER
+# a total-abort blackout) with two new duties + a health step, all behind
+# repo-var switches (off > dry > on):
+#
+#   5. FSM-WATCHDOG (dumb driver): read fsm-lab state.json (contents API) →
+#      halted/paused skip → stale check (stale_after_min=10) → in-flight
+#      pre-filter → dispatch the fsm-lab WATCHDOG workflow via
+#      workflow_dispatch (the in-repo watchdog keeps ALL brains; zero fsm-lab
+#      code changes) → 204-verify by run visibility (10s WARN, re-check at
+#      120s — the dispatch tail is real, worst observed 2m44s). Corrupt state
+#      = dispatch the watchdog SCAN (it alerts, never re-primes), NOT a skip.
+#      Stateless soft-cap latch (8 re-primes/6h → exec-duty-alert issue).
+#   6. MIRROR-HEALTH: two-class verdict (SILENCE: meta status ledger silent
+#      >26h / RED: ≥6 consecutive non-success mirror-runner runs) with
+#      transition-only comments, 24h-deduped aliased alert issues here.
+#   7. DUTY HEALTH (canaries): per-cycle GET /user on the PATs this workflow
+#      holds — 401 = ::warning + alert issue (NEVER a job failure) + scope
+#      drift check; board-sync capability-skip marker + pinger liveness.
+#
+# LOG HYGIENE for the new duties: aliases (fsm/meta/C1/B1), seq/age/streak
+# numbers, HTTP codes, and PUBLIC repo slugs only. The private meta slug and
+# the roster contents are fetched into env vars at runtime and NEVER echoed.
+#
 # This workflow doubles as the public-repo schedule liveness probe: if it never
 # fires, `schedule` is broken account-wide (not just on the private repo) and
 # the driver must move to an external HTTP cron (any pinger service can POST
@@ -60,7 +86,9 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 15 (was 10): the fsm-watchdog 204-verify window alone can hold ~120s of
+    # sleeps on a slow dispatch tail; the legacy scan itself is ~30s.
+    timeout-minutes: 15
     env:
       PRIVATE_REPO: claudecode-headless/cc-gha-exploration
       GH_PAGER: ""
@@ -71,10 +99,114 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Duty roster (fetch + duty-mode resolution)
+        # NEVER fails the job: every failure degrades to the legacy
+        # single-repo path (R3 M2 — a roster hiccup must not be a blackout).
+        # Runs BEFORE the monitor scan so legacy steps can be gated on its
+        # outputs; missing/empty outputs fail OPEN (legacy steps still run).
+        id: roster
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_PRIVATE }}  # step-scoped
+          ROSTER_REPO: claudecode-headless/cc-gha-exploration
+          ROSTER_PATH: .github/roster/repos.json
+          EXEC_DUTY_MODE: ${{ vars.EXEC_DUTY_MODE }}
+          EXEC_DUTY_ROSTER: ${{ vars.EXEC_DUTY_ROSTER }}
+          EXEC_STALL_SCAN: ${{ vars.EXEC_STALL_SCAN }}
+          EXEC_FAILURE_WATCH: ${{ vars.EXEC_FAILURE_WATCH }}
+          EXEC_BOARD_SYNC: ${{ vars.EXEC_BOARD_SYNC }}
+          EXEC_QUOTA_TELEMETRY: ${{ vars.EXEC_QUOTA_TELEMETRY }}
+          EXEC_FSM_WATCHDOG: ${{ vars.EXEC_FSM_WATCHDOG }}
+          EXEC_MIRROR_HEALTH: ${{ vars.EXEC_MIRROR_HEALTH }}
+        run: |
+          set -uo pipefail   # deliberately NOT -e: degrade, never fail
+          . scripts/exec-duty-lib.sh
+          # The fallback roster == today's behavior expressed as data (the
+          # 'swarm' entry alone). Used for EXEC_DUTY_ROSTER=off AND for
+          # DEGRADED mode (roster fetch/validation failure).
+          FALLBACK_ROSTER='{"schema":1,"repos":[{"repo":"claudecode-headless/cc-gha-exploration","alias":"swarm","duties":{"stall-scan":{"enabled":true},"failure-watch":{"enabled":true},"board-sync":{"enabled":true},"quota-telemetry":{"enabled":true}}}]}'
+          mode=ok
+          if [ "${EXEC_DUTY_ROSTER:-}" = "off" ]; then
+            mode=legacy
+            ROSTER_JSON="$FALLBACK_ROSTER"
+            echo "duty roster: EXEC_DUTY_ROSTER=off — legacy single-repo path (byte-exact today's behavior)"
+          else
+            ROSTER_JSON=$(gh api "repos/${ROSTER_REPO}/contents/${ROSTER_PATH}" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || true)
+            if [ -n "${ROSTER_JSON:-}" ] \
+               && printf '%s' "$ROSTER_JSON" | jq -e '(.schema? == 1) and (.repos | type == "array") and (all(.repos[]; ((.repo // "") | type == "string") and ((.duties // "") | type == "object")))' >/dev/null 2>&1; then
+              : # valid — entry count is logged after the file write (never the contents: private slugs)
+            else
+              mode=degraded
+              echo "::error::duty roster fetch/validation FAILED — DEGRADED mode this cycle: legacy single-repo duties ONLY (fsm-watchdog + mirror-health inert). This is a fallback, NOT a blackout. Fix: .github/roster/repos.json in the private swarm repo, or GH_PAT_PRIVATE validity."
+              ROSTER_JSON="$FALLBACK_ROSTER"
+              N=$(exec_alert_find "duty alert: roster degraded")
+              if [ -z "${N:-}" ]; then
+                exec_alert_create "duty alert: roster degraded" "[exec-duty] roster fetch/validation failed at $(date -u +%FT%TZ) — the executor is running DEGRADED (legacy single-repo duties only; fsm-watchdog + mirror-health inert). The roster lives at .github/roster/repos.json in the private swarm repo; check GH_PAT_PRIVATE too. One comment per day while this persists (24h dedup)." >/dev/null
+              elif exec_alert_dedup_ok "$N" 24; then
+                exec_alert_comment "$N" "[exec-duty] roster still degraded as of $(date -u +%FT%TZ) — legacy path only." || true
+              fi
+            fi
+          fi
+          printf '%s' "$ROSTER_JSON" > /tmp/duty-roster.json
+          echo "duty roster: $(jq '.repos | length' /tmp/duty-roster.json 2>/dev/null || echo '?') entries, mode=${mode}"
+
+          # ---- duty-mode resolution: var (off|dry|on) > EXEC_DUTY_MODE > roster ----
+          # Global EXEC_DUTY_MODE=off kills everything (the §6.3 kill-switch);
+          # global dry applies ONLY to the new duties (legacy duties have no
+          # dry semantics — pausing live stall/failure watch would REDUCE
+          # today's coverage; R0's "full-dry" is delivered via per-duty vars).
+          resolve_mode() { # <roster-mode on|dry|off|true|false> <duty-var> <is-new-duty 0|1>
+            local enabled="$1" var="$2" isnew="$3" v g
+            v=$(printf '%s' "${var:-}" | tr '[:upper:]' '[:lower:]')
+            case "$v" in off|dry|on) echo "$v"; return 0 ;; esac
+            g=$(printf '%s' "${EXEC_DUTY_MODE:-}" | tr '[:upper:]' '[:lower:]')
+            case "$g" in
+              off) echo off; return 0 ;;
+              dry) [ "$isnew" = "1" ] && { echo dry; return 0; } ;;
+            esac
+            case "$enabled" in
+              dry)    echo dry ;;
+              on|true) echo on ;;
+              *)      echo off ;;
+            esac
+          }
+          duty_state() { # <duty-key> → roster-level mode on|dry|off
+            # `dry` (roster-level) lets an entry land dry-by-default — the
+            # fail-safe direction (live requires an explicit var=on flip);
+            # entries with only `enabled` behave exactly as before.
+            jq -r --arg d "$1" '
+              [.repos[] | select(.duties[$d] != null) | .duties[$d]] | first
+              | if . == null then "off"
+                elif (.dry // false) then "dry"
+                elif (.enabled // false) then "on"
+                else "off" end' /tmp/duty-roster.json 2>/dev/null || echo off
+          }
+          STALL=$(resolve_mode "$(duty_state stall-scan)" "${EXEC_STALL_SCAN:-}" 0)
+          FWATCH=$(resolve_mode "$(duty_state failure-watch)" "${EXEC_FAILURE_WATCH:-}" 0)
+          BSYNC=$(resolve_mode "$(duty_state board-sync)" "${EXEC_BOARD_SYNC:-}" 0)
+          QUOTA=$(resolve_mode "$(duty_state quota-telemetry)" "${EXEC_QUOTA_TELEMETRY:-}" 0)
+          FSMW=$(resolve_mode "$(duty_state fsm-watchdog)" "${EXEC_FSM_WATCHDOG:-}" 1)
+          MIRR=$(resolve_mode "$(duty_state mirror-health)" "${EXEC_MIRROR_HEALTH:-}" 1)
+          {
+            echo "mode_stall_scan=${STALL}"
+            echo "mode_failure_watch=${FWATCH}"
+            echo "mode_board_sync=${BSYNC}"
+            echo "mode_quota=${QUOTA}"
+            echo "mode_fsm=${FSMW}"
+            echo "mode_mirror=${MIRR}"
+            echo "roster_mode=${mode}"
+          } >> "$GITHUB_OUTPUT"
+          echo "duty modes: stall-scan=${STALL} failure-watch=${FWATCH} board-sync=${BSYNC} quota=${QUOTA} fsm-watchdog=${FSMW} mirror-health=${MIRR} (roster=${mode})"
+          echo "- duty roster: ${mode} — stall-scan=${STALL}, failure-watch=${FWATCH}, board-sync=${BSYNC}, quota=${QUOTA}, fsm-watchdog=${FSMW}, mirror-health=${MIRR}" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Monitor scan (stalls + failed turns + board state)
+        # Roster-gated but fail-OPEN: missing/empty mode outputs (roster step
+        # hiccup) → conditions are true → today's behavior runs unchanged.
+        if: steps.roster.outputs.mode_stall_scan != 'off' || steps.roster.outputs.mode_failure_watch != 'off'
         id: scan
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_PRIVATE }}  # step-scoped: only this step holds the PAT
+          MODE_STALL_SCAN: ${{ steps.roster.outputs.mode_stall_scan }}
+          MODE_FAILURE_WATCH: ${{ steps.roster.outputs.mode_failure_watch }}
         run: |
           set -eo pipefail
           # Agent roster: fetched LIVE from the private repo (no sync drift).
@@ -95,6 +227,15 @@ jobs:
           : > /tmp/scanned-issues
 
           # ---- failure watch: failed agent-workflow runs in the window (95 min) ------
+          # Per-duty gating is INSIDE the step (fail-open: empty mode = run)
+          # so EXEC_FAILURE_WATCH=off disables just this half; a skipped half
+          # still emits its downstream output (failed_count=0) so the notice
+          # step's own if: goes inert instead of reading stale state.
+          if [ "${MODE_FAILURE_WATCH:-on}" = "off" ]; then
+            echo "failure watch: OFF this cycle (EXEC_FAILURE_WATCH / roster)"
+            echo '[ ]' > /tmp/failed.json
+            echo "failed_count=0" >> "$GITHUB_OUTPUT"
+          else
           # Attribution key: the private repo's agent workflows carry
           # run-name "issue-N · <agent>" (Task 36); runs older than that
           # change have no issue in their name and are unattributable (the
@@ -129,8 +270,17 @@ jobs:
             echo "failure watch: 0 failed agent runs in the last 95 min"
           fi
           echo "failed_count=$(jq 'length' /tmp/failed.json)" >> "$GITHUB_OUTPUT"
+          fi
 
           # ---- stall scan + board state (all open issues, full pass) -------
+          # Per-duty gating inside the step (fail-open, same pattern): stall
+          # off → no stall verdicts, issue= stays empty → the sweep dispatch
+          # step's own if: goes inert. Board-state lines still flow (board-sync
+          # has its own independent gate).
+          if [ "${MODE_STALL_SCAN:-on}" = "off" ]; then
+            echo "stall scan: OFF this cycle (EXEC_STALL_SCAN / roster) — no stall verdicts, no sweep dispatch"
+            echo "issue=" >> "$GITHUB_OUTPUT"
+          else
           # Open issues of the private repo, newest-updated first. Numbers only.
           # pipefail (set above): a failed `gh issue list` now FAILS the step
           # visibly instead of silently scanning nothing (review 36-r3).
@@ -208,6 +358,7 @@ jobs:
             echo "issue=" >> "$GITHUB_OUTPUT"
             echo "no stalls detected"
           fi
+          fi   # end stall-scan gate
 
           # ---- closed-issue sweep (board hygiene) ---------------------------
           # The open-issues loop only marks OPEN issues scanned; closed issues
@@ -241,6 +392,9 @@ jobs:
           echo "board state: $(wc -l < /tmp/board-state.jsonl 2>/dev/null || echo 0) active issue(s)"
 
       - name: Board sync (Projects v2 mirror — graceful without project scope)
+        # success() preserved explicitly: adding any `if:` would otherwise
+        # drop the implicit success() gate (behavior stays bit-compatible).
+        if: success() && steps.roster.outputs.mode_board_sync != 'off'
         env:
           GH_PAT_PRIVATE: ${{ secrets.GH_PAT_PRIVATE }}
           BOARD_PAT: ${{ secrets.BOARD_PAT }}   # optional project-scoped override
@@ -378,6 +532,7 @@ jobs:
           done
 
       - name: Private-quota estimate (telemetry)
+        if: success() && steps.roster.outputs.mode_quota != 'off'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_PRIVATE }}
         run: |
@@ -393,3 +548,405 @@ jobs:
                     - (.createdAt | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601)) / 60)
                | add // 0 | floor')
           echo "private-minutes estimate: ~${ESTIMATE} min of wall-clock across the newest ≤200 runs since ${MONTH_START} (trend line, not billing)"
+
+      - name: FSM watchdog duty (dumb driver — the in-repo watchdog keeps ALL brains)
+        # always(): a duty failure upstream must never suppress another duty
+        # (the existing notices/dispatch gating law). Empty mode output = no
+        # roster entry (or degraded mode) = inert, never an error.
+        if: always() && steps.roster.outputs.mode_fsm != 'off' && steps.roster.outputs.mode_fsm != ''
+        id: fsm_duty
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_PRIVATE }}  # step-scoped: only this step holds the PAT
+          MODE: ${{ steps.roster.outputs.mode_fsm }}
+        run: |
+          set -uo pipefail   # a duty NEVER fails the scan job
+          . scripts/exec-duty-lib.sh
+          ENTRY=$(jq -c '[.repos[] | select(.duties["fsm-watchdog"] != null)] | first // empty' /tmp/duty-roster.json 2>/dev/null || true)
+          if [ -z "${ENTRY:-}" ]; then
+            echo "[fsm] no fsm-watchdog entry in the roster — duty inert this cycle"
+            exit 0
+          fi
+          FSM_REPO=$(printf '%s' "$ENTRY" | jq -r '.repo')
+          D=$(printf '%s' "$ENTRY" | jq -c '.duties["fsm-watchdog"]')
+          STATE_REF=$(printf '%s' "$D" | jq -r '.state_branch // "fsm-state"')
+          STATE_PATH=$(printf '%s' "$D" | jq -r '.state_path // "state/state.json"')
+          STALE_MIN=$(printf '%s' "$D" | jq -r '.stale_after_min // 10')
+          WDWF=$(printf '%s' "$D" | jq -r '.watchdog_workflow // "watchdog.yml"')
+          CWF=$(printf '%s' "$D" | jq -r '.conductor_workflow // "conductor.yml"')
+          INFLIGHT_MIN=$(printf '%s' "$D" | jq -r '.inflight_lookback_min // 6')
+          SOFTCAP=$(printf '%s' "$D" | jq -r '.reprime_softcap // 8')
+          WINDOW_H=$(printf '%s' "$D" | jq -r '.reprime_window_h // 6')
+          VERIFY_WAIT=$(printf '%s' "$D" | jq -r '.verify_wait_s // 10')
+          VERIFY_WINDOW=$(printf '%s' "$D" | jq -r '.verify_window_s // 120')
+          DMODE=$(printf '%s' "$D" | jq -r '.mode // "dispatch-watchdog"')
+          if [ "$DMODE" != "dispatch-watchdog" ]; then
+            # design 2.4: direct-reprime is documented-off; v1 wires ONLY the
+            # dumb-driver lane (zero brain duplication).
+            echo "[fsm] roster mode '${DMODE}' is not wired in v1 (direct-reprime rejected) — duty inert"
+            exit 0
+          fi
+
+          # ---- 1. state read (contents API; ~8KB — well inside the base64 limit) ----
+          STATE=$(gh api "repos/${FSM_REPO}/contents/${STATE_PATH}?ref=${STATE_REF}" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || true)
+          STATE_OK=0; SEQ=""; AGE_MIN=""; HALTED=false; PAUSED=false
+          if [ -n "${STATE:-}" ] && SEQ=$(printf '%s' "$STATE" | jq -r '.chain.seq // empty' 2>/dev/null) && [ -n "$SEQ" ]; then
+            STATE_OK=1
+            LAST_TICK=$(printf '%s' "$STATE" | jq -r '.chain.last_tick // empty')
+            HALTED=$(printf '%s' "$STATE" | jq -r '.chain.halted // false')
+            PAUSED=$(printf '%s' "$STATE" | jq -r '.chain.paused // false')
+            if [ -n "$LAST_TICK" ]; then
+              AGE_MIN=$(( ($(date +%s) - $(date -u -d "$LAST_TICK" +%s)) / 60 ))
+            fi
+          fi
+
+          VERDICT=dispatch
+          if [ "$STATE_OK" = "1" ]; then
+            echo "[fsm] state: seq=${SEQ} age=${AGE_MIN:-?}min stale_after=${STALE_MIN}min halted=${HALTED} paused=${PAUSED}"
+            if [ "$HALTED" = "true" ]; then
+              echo "[fsm] mode=halted — skip (chain intentionally held; zero dispatches)"
+              VERDICT=halted-skip
+            elif [ "$PAUSED" = "true" ]; then
+              echo "[fsm] mode=paused — skip (operator hold)"
+              VERDICT=paused-skip
+            elif [ -z "${AGE_MIN}" ]; then
+              echo "::warning::[fsm] state readable but last_tick unparseable — corrupt-state path"
+              STATE_OK=0
+            elif [ "${AGE_MIN}" -lt "${STALE_MIN}" ]; then
+              echo "[fsm] fresh (age ${AGE_MIN}min < ${STALE_MIN}min) — no dispatch"
+              VERDICT=fresh-skip
+            else
+              echo "[fsm] stale (age ${AGE_MIN}min ≥ ${STALE_MIN}min) — proceeding to the in-flight pre-filter"
+            fi
+          else
+            # R3 M3 amendment: corrupt/unreadable state → dispatch the watchdog
+            # SCAN (it alerts on corrupt state, never re-primes on unknown
+            # state — scan.mjs conservatism). Skip-and-log would leave the
+            # corrupt-state alert riding the sparse native lane for hours.
+            echo "::warning::[fsm] state.json unreadable (fetch/parse failed) — corrupt-state path: the watchdog SCAN will be dispatched (alert-only lane)"
+          fi
+
+          if [ "$VERDICT" != "dispatch" ]; then
+            echo "- [fsm] watchdog duty: mode=${MODE} seq=${SEQ:-?} verdict=${VERDICT}" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # ---- 2. in-flight pre-filter (a PRE-filter, not a brain) ----
+          # lookback = inflight_lookback_min (R3: "created ≥ 6 min ago" was
+          # direction-ambiguous — lookback intended). A missed long-running
+          # turn merely costs one idempotent 9s watchdog scan.
+          CUTOFF=$(date -u -d "-${INFLIGHT_MIN} min" +%Y-%m-%dT%H:%M:%SZ)
+          RUNS=$(gh run list -R "${FSM_REPO}" --workflow "${CWF}" --limit 5 --json status,createdAt 2>/dev/null || echo '[]')
+          INFLIGHT=$(printf '%s' "$RUNS" | jq -r --arg c "$CUTOFF" '[.[] | select(.createdAt > $c) | select(.status == "queued" or .status == "in_progress")] | length' 2>/dev/null || echo 0)
+          if [ "${INFLIGHT:-0}" -gt 0 ]; then
+            echo "[fsm] in-flight conductor run(s): ${INFLIGHT} within ${INFLIGHT_MIN}min — skip (the watchdog's own check is the authority)"
+            echo "- [fsm] watchdog duty: mode=${MODE} seq=${SEQ:-?} verdict=inflight-skip" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # ---- 3. soft-cap latch (stateless; the OPEN alert issue is the latch) ----
+          LATCH=$(exec_alert_find "duty alert: fsm re-prime storm")
+          if [ -n "${LATCH:-}" ]; then
+            echo "[fsm] soft-cap latch OPEN (alert issue #${LATCH}) — executor-driven watchdog dispatches suppressed until a human closes it (closing re-arms)"
+            echo "- [fsm] watchdog duty: mode=${MODE} seq=${SEQ:-?} verdict=latch-open" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          RCUTOFF=$(date -u -d "-${WINDOW_H} hours" +%Y-%m-%dT%H:%M:%SZ)
+          RREP=$(gh run list -R "${FSM_REPO}" --workflow "${CWF}" --limit 50 --json name,createdAt 2>/dev/null || echo '[]')
+          REPRIMES=$(printf '%s' "$RREP" | jq -r --arg c "$RCUTOFF" '[.[] | select(.createdAt > $c) | select((.name // "") | contains("watchdog-reprime"))] | length' 2>/dev/null || echo 0)
+          echo "[fsm] watchdog-reprime conductor runs in the last ${WINDOW_H}h: ${REPRIMES:-0} (soft-cap ${SOFTCAP})"
+          if [ "${REPRIMES:-0}" -ge "${SOFTCAP}" ]; then
+            if [ "$MODE" = "dry" ]; then
+              echo "[fsm] DRY: soft-cap tripped (${REPRIMES} reprimes/${WINDOW_H}h ≥ ${SOFTCAP}) — would OPEN latch issue 'duty alert: fsm re-prime storm' and stop dispatching"
+            else
+              LN=$(exec_alert_create "duty alert: fsm re-prime storm" "[exec-duty] ${REPRIMES} watchdog-reprime runs in the last ${WINDOW_H}h (soft-cap ${SOFTCAP}) while the chain stays stale. Executor-driven watchdog dispatches are PAUSED while this issue is open (stateless latch — close it to re-arm). The in-repo watchdog breaker remains the sole re-prime/breaker authority. Opened $(date -u +%FT%TZ).")
+              if [ -n "${LN:-}" ]; then
+                echo "[fsm] soft-cap tripped — opened latch issue #${LN}; dispatch suppressed this cycle"
+              else
+                echo "::warning::[fsm] soft-cap tripped but latch issue creation failed — suppressing dispatch this cycle anyway (conservative)"
+              fi
+            fi
+            echo "- [fsm] watchdog duty: mode=${MODE} seq=${SEQ:-?} verdict=softcap-tripped" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # ---- 4. dispatch (or dry-run) + 204-verification ----
+          if [ "$MODE" = "dry" ]; then
+            echo "[fsm] DRY-WOULD-DISPATCH: POST /repos/${FSM_REPO}/actions/workflows/${WDWF}/dispatches {\"ref\":\"main\"}"
+            echo "[fsm] dry mode — no dispatch sent (flip EXEC_FSM_WATCHDOG=on after verifying these logs)"
+            echo "- [fsm] watchdog duty: mode=dry seq=${SEQ:-?} verdict=would-dispatch" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "[fsm] dispatching the watchdog scan (workflow_dispatch, ref=main)"
+          T0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          if ! gh api -X POST "repos/${FSM_REPO}/actions/workflows/${WDWF}/dispatches" -f ref=main >/dev/null 2>&1; then
+            echo "::warning::[fsm] watchdog dispatch POST failed (HTTP error) — the native watchdog scans remain the backstop"
+            echo "- [fsm] watchdog duty: mode=${MODE} seq=${SEQ:-?} verdict=dispatch-failed" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # 204 = ACCEPTED, not delivered (Task-35 law). The dispatch→run-created
+          # tail is real (worst observed 2m44s / 347s): WARN at 10s — never a
+          # false failure — then ONE re-check at 120s (R3 MINOR amendment).
+          sleep "$VERIFY_WAIT"
+          CREATED=$(gh run list -R "${FSM_REPO}" --workflow "${WDWF}" --limit 5 --json createdAt 2>/dev/null \
+            | jq -r --arg t0 "$T0" '[.[] | select(.createdAt > $t0)] | length' 2>/dev/null || echo 0)
+          if [ "${CREATED:-0}" -gt 0 ]; then
+            echo "[fsm] watchdog run created and visible (verified at ${VERIFY_WAIT}s)"
+            V=dispatched+verified
+          else
+            echo "::warning::[fsm] dispatch accepted but no watchdog run visible at ${VERIFY_WAIT}s — known dispatch-latency tail (worst observed 2m44s); re-checking once at ${VERIFY_WINDOW}s"
+            sleep $(( VERIFY_WINDOW > VERIFY_WAIT ? VERIFY_WINDOW - VERIFY_WAIT : 0 ))
+            CREATED2=$(gh run list -R "${FSM_REPO}" --workflow "${WDWF}" --limit 5 --json createdAt 2>/dev/null \
+              | jq -r --arg t0 "$T0" '[.[] | select(.createdAt > $t0)] | length' 2>/dev/null || echo 0)
+            if [ "${CREATED2:-0}" -gt 0 ]; then
+              echo "[fsm] watchdog run created — verified on the ${VERIFY_WINDOW}s re-check (latency tail confirmed; dispatch NOT dropped)"
+              V=dispatched+verified-slow
+            else
+              echo "::warning::[fsm] dispatch accepted but NO watchdog run appeared within ${VERIFY_WINDOW}s — dispatch likely dropped (native watchdog scans remain the backstop)"
+              V=dispatched-unverified
+            fi
+          fi
+          echo "- [fsm] watchdog duty: mode=${MODE} seq=${SEQ:-?} verdict=${V}" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Mirror-health duty (two-class verdict — SILENCE / RED)
+        # Alert-only duty: zero dispatches anywhere (R1 rollout — live by
+        # adjudication). The private meta slug is read into an env var from
+        # the roster and NEVER logged; logs use the alias 'meta' only.
+        if: always() && steps.roster.outputs.mode_mirror != 'off' && steps.roster.outputs.mode_mirror != ''
+        id: mirror_duty
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_PRIVATE }}  # step-scoped
+          MODE: ${{ steps.roster.outputs.mode_mirror }}
+        run: |
+          set -uo pipefail   # a duty NEVER fails the scan job
+          . scripts/exec-duty-lib.sh
+          ENTRY=$(jq -c '[.repos[] | select(.duties["mirror-health"] != null)] | first // empty' /tmp/duty-roster.json 2>/dev/null || true)
+          if [ -z "${ENTRY:-}" ]; then
+            echo "[meta] no mirror-health entry in the roster — duty inert this cycle"
+            exit 0
+          fi
+          META_REPO=$(printf '%s' "$ENTRY" | jq -r '.repo')            # private slug — NEVER echoed
+          D=$(printf '%s' "$ENTRY" | jq -c '.duties["mirror-health"]')
+          STATUS_PATH=$(printf '%s' "$D" | jq -r '.status_path // "status/latest.json"')
+          RUNS_REPO=$(printf '%s' "$D" | jq -r '.runs_repo // "xfnwfpho1/mirror-runner"')  # public — loggable
+          RUNS_WF=$(printf '%s' "$D" | jq -r '.runs_workflow // "catch-all-mirror.yml"')
+          SILENCE_H=$(printf '%s' "$D" | jq -r '.silence_after_h // 26')
+          STREAK_MIN=$(printf '%s' "$D" | jq -r '.fail_streak // 6')
+          WANT_META=$(printf '%s' "$D" | jq -r '.alert.meta_comment_on_transition // true')
+
+          # ---- 1. the private status ledger (SILENCE class) ----
+          LATEST=$(gh api "repos/${META_REPO}/contents/${STATUS_PATH}" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || true)
+          TS=$(printf '%s' "${LATEST:-}" | jq -r '.ts // empty' 2>/dev/null || true)
+          if [ -z "${TS:-}" ]; then
+            # a READ failure is not a silence verdict — stay quiet, never false-alert
+            echo "::warning::[meta] status ledger unreadable this cycle (fetch/parse) — mirror-health BLIND this cycle"
+            exit 0
+          fi
+          TS_AGE_H=$(( ($(date +%s) - $(date -u -d "$TS" +%s)) / 3600 ))
+          REPOS_TOTAL=$(printf '%s' "$LATEST" | jq -r '.repos_total // "?"')
+          NEED=$(printf '%s' "$LATEST" | jq -r '.need_attention // "?"')
+          INSYNC=$(printf '%s' "$LATEST" | jq -r '.in_sync // "?"')
+          RUN_URL=$(printf '%s' "$LATEST" | jq -r '.url // empty')   # public runner run URL — allowed in alert bodies
+
+          # ---- 2. the runner's own runs (RED class; F-5 folded: TTL-killed
+          # runs read 'cancelled' — counted not-success, reported separately) ----
+          RUNS=$(gh run list -R "${RUNS_REPO}" --workflow "${RUNS_WF}" --limit 10 --json status,conclusion 2>/dev/null || echo '[]')
+          STREAK=0; FAILS=0; CANCELS=0
+          while read -r CONCL; do
+            [ -n "$CONCL" ] || continue
+            [ "$CONCL" = "success" ] && break
+            STREAK=$((STREAK+1))
+            case "$CONCL" in
+              failure)  FAILS=$((FAILS+1)) ;;
+              cancelled) CANCELS=$((CANCELS+1)) ;;
+            esac
+          done < <(printf '%s' "$RUNS" | jq -r '.[] | select(.status == "completed") | .conclusion // "unknown"' 2>/dev/null || true)
+
+          VERDICT=GREEN
+          if [ "${TS_AGE_H}" -ge "${SILENCE_H}" ]; then
+            VERDICT=SILENCE   # the runner itself is dead — worse than red
+          elif [ "${STREAK}" -ge "${STREAK_MIN}" ]; then
+            VERDICT=RED
+          fi
+          echo "[meta] ts_age=${TS_AGE_H}h streak=${STREAK} (fail=${FAILS} cancel=${CANCELS}) counts=${REPOS_TOTAL}/${NEED}/${INSYNC} verdict=${VERDICT}"
+
+          alert_body() { # <class> — counts/ts_age/streak + PUBLIC run URL; NEVER the private slug
+            local v="$1" extra=""
+            case "$v" in
+              SILENCE) extra="The mirror status ledger has not updated in ${TS_AGE_H}h (silence threshold ${SILENCE_H}h) — the mirror runner itself looks dead (worse than red)." ;;
+              RED)     extra="Consecutive non-success mirror runs: ${STREAK} (${FAILS} failure + ${CANCELS} cancelled; red threshold ${STREAK_MIN})." ;;
+              GREEN)   extra="Recovered: ledger ts_age=${TS_AGE_H}h, streak=${STREAK}." ;;
+            esac
+            printf '[exec-duty] mirror-health verdict: %s — %s Ledger counts (total/need-attention/in-sync): %s/%s/%s. Latest runner run: %s' \
+              "$v" "$extra" "$REPOS_TOTAL" "$NEED" "$INSYNC" "${RUN_URL:-n/a}"
+          }
+
+          # ---- 3. transition detection + alerts (24h dedup; the 127-unread-
+          # comments lesson: transition-only meta comments, never per-run) ----
+          ISSUE_N=$(exec_alert_find "duty alert: mirror-health")
+          PREV=none
+          if [ -n "${ISSUE_N:-}" ]; then
+            # order-independent newest-marker (the comments API ignores
+            # sort/direction server-side — W2-b law 20): sort_by created_at
+            # INSIDE jq, take last; never trust per_page ordering.
+            PREV=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_N}/comments?per_page=20" 2>/dev/null \
+              | jq -r '[.[] | select((.body // "") | startswith("[exec-duty]"))] | sort_by(.created_at) | last | .body // empty' 2>/dev/null \
+              | grep -o 'verdict: [A-Z]*' | tail -1 | awk '{print $2}' || true)
+            if [ -z "${PREV:-}" ]; then
+              PREV=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_N}" --jq '.body // ""' 2>/dev/null \
+                | grep -o 'verdict: [A-Z]*' | head -1 | awk '{print $2}' || true)
+            fi
+            [ -n "${PREV:-}" ] || PREV=unknown
+          fi
+
+          if [ "$MODE" != "on" ]; then
+            echo "[meta] dry mode — verdict=${VERDICT} logged only (prev=${PREV}, open alert issue=${ISSUE_N:-none})"
+            case "$VERDICT" in
+              GREEN)
+                if [ -n "${ISSUE_N:-}" ]; then echo "[meta] DRY would: comment+close alert issue #${ISSUE_N} + meta transition note"; fi ;;
+              *)
+                if [ -z "${ISSUE_N:-}" ]; then
+                  echo "[meta] DRY would: CREATE exec-duty-alert issue 'duty alert: mirror-health' + meta transition comment"
+                else
+                  echo "[meta] DRY would: comment alert issue #${ISSUE_N} (transition or 24h-deduped heartbeat)"
+                fi ;;
+            esac
+            echo "- [meta] mirror-health duty: mode=${MODE} verdict=${VERDICT} (ts_age=${TS_AGE_H}h, streak=${STREAK})" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          meta_note() { # transition-only comment on the private meta repo's catchall-failure issue
+            [ "${WANT_META}" = "true" ] || return 0
+            local MIID
+            MIID=$(gh api "repos/${META_REPO}/issues?state=open&labels=catchall-failure&per_page=5" 2>/dev/null \
+              | jq -r '[.[].number][0] // empty' 2>/dev/null || true)
+            if [ -n "${MIID:-}" ]; then
+              if jq -n --arg b "[exec-duty] mirror-health verdict transition ${1} at $(date -u +%FT%TZ) — ts_age=${TS_AGE_H}h streak=${STREAK}; detail on the executor's public duty-alert issue." '{body: $b}' 2>/dev/null \
+                 | gh api -X POST "repos/${META_REPO}/issues/${MIID}/comments" --input - >/dev/null 2>&1; then
+                echo "[meta] transition note posted to the tracking issue"
+              else
+                echo "::warning::[meta] transition comment failed to post"
+              fi
+            else
+              echo "[meta] no open catchall-failure tracking issue — transition logged only"
+            fi
+          }
+
+          case "$VERDICT" in
+            GREEN)
+              if [ -n "${ISSUE_N:-}" ]; then
+                exec_alert_close "${ISSUE_N}" "$(alert_body GREEN)" || true
+                echo "[meta] verdict GREEN with an open alert issue — recovery comment + close (self-healing latch)"
+                meta_note "${PREV}->GREEN"
+              else
+                echo "[meta] green — nothing to do"
+              fi ;;
+            RED|SILENCE)
+              BODY=$(alert_body "$VERDICT")
+              if [ -z "${ISSUE_N:-}" ]; then
+                AN=$(exec_alert_create "duty alert: mirror-health" "$BODY")
+                if [ -n "${AN:-}" ]; then
+                  echo "[meta] verdict ${VERDICT} — opened exec-duty-alert issue #${AN}"
+                  meta_note "GREEN->${VERDICT}"
+                else
+                  echo "::warning::[meta] alert issue creation failed (issues disabled?) — verdict logged only"
+                fi
+              elif [ "${PREV}" != "$VERDICT" ]; then
+                exec_alert_comment "${ISSUE_N}" "$BODY" || true
+                echo "[meta] verdict transition ${PREV}->${VERDICT} — commented alert issue #${ISSUE_N}"
+                meta_note "${PREV}->${VERDICT}"
+              elif exec_alert_dedup_ok "${ISSUE_N}" 24; then
+                exec_alert_comment "${ISSUE_N}" "$BODY" || true
+                echo "[meta] verdict ${VERDICT} steady — daily heartbeat comment on issue #${ISSUE_N}"
+              else
+                echo "[meta] verdict ${VERDICT} steady — heartbeat comment deduped (24h)"
+              fi ;;
+          esac
+          echo "- [meta] mirror-health duty: mode=${MODE} verdict=${VERDICT} (ts_age=${TS_AGE_H}h, streak=${STREAK})" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Duty health (credential canaries — never fails the run)
+        # The electronic half of the PAT-expiry probe (design §5.3): the
+        # #1 silent killer (token death — the GL_PAT 9-day outage class)
+        # becomes a ≤1-cycle WARNING + alert issue. Canary failure is a
+        # WARNING by adjudication, never a job failure.
+        if: always()
+        id: duty_health
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_PRIVATE }}  # step-scoped
+          BOARD_PAT: ${{ secrets.BOARD_PAT }}       # optional project-scoped token
+          EXEC_PINGER: ${{ vars.EXEC_PINGER }}
+        run: |
+          set -uo pipefail
+          . scripts/exec-duty-lib.sh
+
+          # ---- C1: GH_PAT_PRIVATE (registry/roster reads, dispatches, mirror reads) ----
+          C1_CODE=$(curl -sS -o /tmp/dh-c1.json -D /tmp/dh-c1.hdr -w '%{http_code}' --max-time 30 \
+            -H "Authorization: token ${GH_TOKEN}" https://api.github.com/user 2>/dev/null || echo 000)
+          if [ "${C1_CODE}" = "200" ]; then
+            C1_SCOPES=$(sed -n 's/^[Xx]-[Oo]auth-[Ss]copes:[[:space:]]*//p' /tmp/dh-c1.hdr | tr -d '\r' | head -1)
+            echo "duty-health: C1 (GH_PAT_PRIVATE) canary OK — scopes: ${C1_SCOPES:-unknown}"
+            if ! printf ',%s,' "${C1_SCOPES:-}" | grep -q ',repo,' || ! printf ',%s,' "${C1_SCOPES:-}" | grep -q ',workflow,'; then
+              # scope-narrowing rotation breaks duties silently — inline the
+              # pat-scope-audit per cycle instead of a one-off workflow
+              echo "::warning::duty-health: C1 scope drift — expected 'repo, workflow', got '${C1_SCOPES:-none}' (roster/registry reads + watchdog dispatch will start failing)"
+            fi
+          else
+            echo "::warning::duty-health: C1 (GH_PAT_PRIVATE) canary FAILED (HTTP ${C1_CODE}) — WARNING by design, not a failure: the legacy scan already aborts loudly on a dead PAT; duties are blind until rotation"
+            N=$(exec_alert_find "duty alert: credential dead (C1)")
+            if [ -z "${N:-}" ]; then
+              exec_alert_create "duty alert: credential dead (C1)" "[exec-duty] GH_PAT_PRIVATE canary failed (HTTP ${C1_CODE}) at $(date -u +%FT%TZ) — all private-repo reads and dispatches are dead. Rotate the secret. One comment/day while dead (24h dedup); close this issue when fixed." >/dev/null
+            elif exec_alert_dedup_ok "$N" 24; then
+              exec_alert_comment "$N" "[exec-duty] GH_PAT_PRIVATE still dead as of $(date -u +%FT%TZ) (canary HTTP ${C1_CODE})." || true
+            fi
+          fi
+
+          # ---- B1: BOARD_PAT (board-sync's project-scoped token) ----
+          if [ -n "${BOARD_PAT:-}" ]; then
+            B1_CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
+              -H "Authorization: token ${BOARD_PAT}" https://api.github.com/user 2>/dev/null || echo 000)
+            if [ "${B1_CODE}" = "200" ]; then
+              echo "duty-health: B1 (BOARD_PAT) canary OK"
+            else
+              echo "::warning::duty-health: B1 (BOARD_PAT) canary FAILED (HTTP ${B1_CODE}) — board-sync degrades silently (its graceful-skip keeps the scheduler green)"
+              N=$(exec_alert_find "duty alert: credential dead (B1)")
+              if [ -z "${N:-}" ]; then
+                exec_alert_create "duty alert: credential dead (B1)" "[exec-duty] BOARD_PAT canary failed (HTTP ${B1_CODE}) at $(date -u +%FT%TZ) — board-sync is silently degrading to skip. Rotate the secret." >/dev/null
+              elif exec_alert_dedup_ok "$N" 24; then
+                exec_alert_comment "$N" "[exec-duty] BOARD_PAT still dead as of $(date -u +%FT%TZ) (canary HTTP ${B1_CODE})." || true
+              fi
+            fi
+          else
+            echo "duty-health: BOARD_PAT unset — board-sync runs on GH_PAT_PRIVATE (repo+workflow only → board skip is the audited default)"
+          fi
+
+          # ---- board-sync capability-skip marker (scope loss looks benign) ----
+          if [ -f /tmp/board-skip ]; then
+            echo "::warning::duty-health: board-sync SKIPPED this cycle (capability: token lacks project scope) — alerting with 24h dedup"
+            N=$(exec_alert_find "duty alert: board-sync degraded")
+            if [ -z "${N:-}" ]; then
+              exec_alert_create "duty alert: board-sync degraded" "[exec-duty] board-sync gracefully skipped at $(date -u +%FT%TZ) — the token in play lacks the project scope (INSUFFICIENT_SCOPES). The board will silently go stale; add/rotate BOARD_PAT." >/dev/null
+            elif exec_alert_dedup_ok "$N" 24; then
+              exec_alert_comment "$N" "[exec-duty] board-sync still skipping as of $(date -u +%FT%TZ)." || true
+            fi
+          fi
+
+          # ---- pinger liveness (arms only when the pinger lane is configured;
+          # the repository_dispatch trigger + provider job land in W-C) ----
+          if [ "${EXEC_PINGER:-}" = "on" ]; then
+            PCUT=$(date -u -d '-3 hours' +%Y-%m-%dT%H:%M:%SZ)
+            PRUNS=$(gh run list -R "${GITHUB_REPOSITORY}" --event repository_dispatch --limit 10 --json createdAt 2>/dev/null || echo '[]')
+            PIN=$(printf '%s' "$PRUNS" | jq -r --arg c "$PCUT" '[.[] | select(.createdAt > $c)] | length' 2>/dev/null || echo 0)
+            if [ "${PIN:-0}" -eq 0 ]; then
+              echo "::warning::duty-health: pinger lane SILENT — no repository_dispatch runs in 3h while EXEC_PINGER=on (the de-correlated wake source is down; native cadence is the floor)"
+              N=$(exec_alert_find "duty alert: pinger silent")
+              if [ -z "${N:-}" ]; then
+                exec_alert_create "duty alert: pinger silent" "[exec-duty] no repository_dispatch (cron-ping) runs in the last 3h while EXEC_PINGER=on — the external pinger is down (provider job paused? PAT expired?). Native schedule is the current floor." >/dev/null
+              elif exec_alert_dedup_ok "$N" 24; then
+                exec_alert_comment "$N" "[exec-duty] pinger still silent as of $(date -u +%FT%TZ)." || true
+              fi
+            else
+              echo "duty-health: pinger lane alive (${PIN} ping run(s) in 3h)"
+            fi
+          fi
+          exit 0
