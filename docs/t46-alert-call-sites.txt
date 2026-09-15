@@ -1,0 +1,106 @@
+# T46-A2 — alert-lane call-site table (the sweep inventory)
+
+Built BEFORE any code change (M4 amendment demand: the impl builds the call-site
+table first — every mode=on create/comment site gets the R2-law-5 gate; `|| true`
+survives ONLY on best-effort diagnostic paths, never on latch-mutating posts).
+
+Command (byte-exact, run against the un-modified tree at 895965f):
+
+    grep -n "exec_alert_\|repos/\${GITHUB_REPOSITORY}" scripts/exec-duty-lib.sh .github/workflows/scheduler.yml
+
+## 1. Raw pre-change inventory (50 lines)
+
+```
+scripts/exec-duty-lib.sh:19:# exec_alert_find <title-prefix> → open exec-duty-alert issue number (or empty)
+scripts/exec-duty-lib.sh:20:exec_alert_find() {
+scripts/exec-duty-lib.sh:22:  n=$(gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&labels=exec-duty-alert&per_page=20" 2>/dev/null \
+scripts/exec-duty-lib.sh:28:# exec_alert_create <title> <body> → new issue number on stdout (empty on failure).
+scripts/exec-duty-lib.sh:30:exec_alert_create() {
+scripts/exec-duty-lib.sh:33:    | gh api -X POST "repos/${GITHUB_REPOSITORY}/issues" --input - --jq '.number' 2>/dev/null \
+scripts/exec-duty-lib.sh:43:# exec_alert_comment <issue-number> <body> → 0 posted / 1 failed (diagnostics stderr)
+scripts/exec-duty-lib.sh:44:exec_alert_comment() {
+scripts/exec-duty-lib.sh:47:     | gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${num}/comments" --input - >/dev/null 2>&1; then
+scripts/exec-duty-lib.sh:55:# exec_alert_close <issue-number> <final-body> → comment + close (best effort)
+scripts/exec-duty-lib.sh:56:exec_alert_close() {
+scripts/exec-duty-lib.sh:58:  exec_alert_comment "$num" "$body" || true
+scripts/exec-duty-lib.sh:59:  if gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/${num}" -f state=closed >/dev/null 2>&1; then
+scripts/exec-duty-lib.sh:66:# exec_alert_marker_age_h <issue-number> → hours (integer) since the newest
+scripts/exec-duty-lib.sh:72:exec_alert_marker_age_h() {
+scripts/exec-duty-lib.sh:74:  ts=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${num}/comments?per_page=20&direction=desc" 2>/dev/null \
+scripts/exec-duty-lib.sh:79:    ts=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${num}" \
+scripts/exec-duty-lib.sh:86:# exec_alert_dedup_ok <issue-number> [dedup_h] → 0 when a marker comment should
+scripts/exec-duty-lib.sh:89:exec_alert_dedup_ok() {
+scripts/exec-duty-lib.sh:91:  age=$(exec_alert_marker_age_h "$num")
+.github/workflows/scheduler.yml:141:              N=$(exec_alert_find "duty alert: roster degraded")
+.github/workflows/scheduler.yml:143:                exec_alert_create "duty alert: roster degraded" "[exec-duty] roster fetch/validation failed at $(date -u +%FT%TZ) — the executor is running DEGRADED (legacy single-repo duties only; fsm-watchdog + mirror-health inert). The roster lives at .github/roster/repos.json in the private swarm repo; check GH_PAT_PRIVATE too. One comment per day while this persists (24h dedup)." >/dev/null
+.github/workflows/scheduler.yml:144:              elif exec_alert_dedup_ok "$N" 24; then
+.github/workflows/scheduler.yml:145:              exec_alert_comment "$N" "[exec-duty] roster still degraded as of $(date -u +%FT%TZ) — legacy path only." || true
+.github/workflows/scheduler.yml:647:          LATCH=$(exec_alert_find "duty alert: fsm re-prime storm")
+.github/workflows/scheduler.yml:661:              LN=$(exec_alert_create "duty alert: fsm re-prime storm" "[exec-duty] ${REPRIMES} watchdog-reprime runs in the last ${WINDOW_H}h (soft-cap ${SOFTCAP}) while the chain stays stale. Executor-driven watchdog dispatches are PAUSED while this issue is open (stateless latch — close it to re-arm). The in-repo watchdog breaker remains the sole re-prime/breaker authority. Opened $(date -u +%FT%TZ).")
+.github/workflows/scheduler.yml:786:          ISSUE_N=$(exec_alert_find "duty alert: mirror-health")
+.github/workflows/scheduler.yml:792:            PREV=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_N}/comments?per_page=20" 2>/dev/null \
+.github/workflows/scheduler.yml:796:              PREV=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_N}" --jq '.body // ""' 2>/dev/null \
+.github/workflows/scheduler.yml:838:                exec_alert_close "${ISSUE_N}" "$(alert_body GREEN)" || true
+.github/workflows/scheduler.yml:847:                AN=$(exec_alert_create "duty alert: mirror-health" "$BODY")
+.github/workflows/scheduler.yml:855:                exec_alert_comment "${ISSUE_N}" "$BODY" || true
+.github/workflows/scheduler.yml:858:              elif exec_alert_dedup_ok "${ISSUE_N}" 24; then
+.github/workflows/scheduler.yml:859:                exec_alert_comment "${ISSUE_N}" "$BODY" || true
+.github/workflows/scheduler.yml:896:            N=$(exec_alert_find "duty alert: credential dead (C1)")
+.github/workflows/scheduler.yml:898:              exec_alert_create "duty alert: credential dead (C1)" "[exec-duty] GH_PAT_PRIVATE canary failed (HTTP ${C1_CODE}) at $(date -u +%FT%TZ) — all private-repo reads and dispatches are dead. Rotate the secret. One comment/day while dead (24h dedup); close this issue when fixed." >/dev/null
+.github/workflows/scheduler.yml:899:            elif exec_alert_dedup_ok "$N" 24; then
+.github/workflows/scheduler.yml:900:              exec_alert_comment "$N" "[exec-duty] GH_PAT_PRIVATE still dead as of $(date -u +%FT%TZ) (canary HTTP ${C1_CODE})." || true
+.github/workflows/scheduler.yml:912:              N=$(exec_alert_find "duty alert: credential dead (B1)")
+.github/workflows/scheduler.yml:914:                exec_alert_create "duty alert: credential dead (B1)" "[exec-duty] BOARD_PAT canary failed (HTTP ${B1_CODE}) at $(date -u +%FT%TZ) — board-sync is silently degrading to skip. Rotate the secret." >/dev/null
+.github/workflows/scheduler.yml:915:              elif exec_alert_dedup_ok "$N" 24; then
+.github/workflows/scheduler.yml:916:              exec_alert_comment "$N" "[exec-duty] BOARD_PAT still dead as of $(date -u +%FT%TZ) (canary HTTP ${B1_CODE})." || true
+.github/workflows/scheduler.yml:926:            N=$(exec_alert_find "duty alert: board-sync degraded")
+.github/workflows/scheduler.yml:928:              exec_alert_create "duty alert: board-sync degraded" "[exec-duty] board-sync gracefully skipped at $(date -u +%FT%TZ) — the token in play lacks the project scope (INSUFFICIENT_SCOPES). The board will silently go stale; add/rotate BOARD_PAT." >/dev/null
+.github/workflows/scheduler.yml:929:            elif exec_alert_dedup_ok "$N" 24; then
+.github/workflows/scheduler.yml:930:              exec_alert_comment "$N" "[exec-duty] board-sync still skipping as of $(date -u +%FT%TZ)." || true
+.github/workflows/scheduler.yml:942:              N=$(exec_alert_find "duty alert: pinger silent")
+.github/workflows/scheduler.yml:944:              exec_alert_create "duty alert: pinger silent" "[exec-duty] no repository_dispatch (cron-ping) runs in the last 3h while EXEC_PINGER=on — the external pinger is down (provider job paused? PAT expired?). Native schedule is the current floor." >/dev/null
+.github/workflows/scheduler.yml:945:              elif exec_alert_dedup_ok "$N" 24; then
+.github/workflows/scheduler.yml:946:              exec_alert_comment "$N" "[exec-duty] pinger still silent as of $(date -u +%FT%TZ)." || true
+```
+
+## 2. Disposition table (what the sweep does to every site)
+
+| # | Site (file:line, pre-change) | Call | Disposition |
+|---|------------------------------|------|-------------|
+| 1 | lib:22 | find GET `repos/${GITHUB_REPOSITORY}/issues` | RETARGET via `_alert_repo()`; label dropped from filter; per_page 20→50; numeric validation added; token via `_alert_token()` |
+| 2 | lib:33 | create POST `repos/${GITHUB_REPOSITORY}/issues` | RETARGET; POST via `_alert_curl` (curl wrapper, M1); `.number` + `case` numeric validation; rc 1 on failure; raw body never on stdout |
+| 3 | lib:47 | comment POST `.../issues/${num}/comments` | RETARGET; POST via `_alert_curl`; real rc |
+| 4 | lib:58-59 | close (comment + PATCH `.../issues/${num}`) | RETARGET; PATCH via `_alert_curl`; real rc (the old never-fails close is dead — M4) |
+| 5 | lib:74 | marker_age_h comments GET | RETARGET (B2 — the missed helper) |
+| 6 | lib:79 | marker_age_h issue-body fallback GET | RETARGET (B2) |
+| 7 | wf:141-146 | roster-degraded find/create/dedup/comment | MOVED to duty-health (B1 — the roster step must NEVER fail; alerting now rides the always() step); posts gated there |
+| 8 | wf:647 | fsm soft-cap latch find | stays (GET; detection, never gates) — now routes via `_alert_repo()` through the lib |
+| 9 | wf:661 | fsm soft-cap latch create | GATED: mode=on create failure → `::error` + `exit 1` (this is the live 410-defect class) |
+| 10 | wf:786 | mirror latch find | stays (GET) |
+| 11 | wf:792 | raw PREV comments GET | RETARGET via `_alert_repo()` (B2 — raw call the six-helper enumeration missed) |
+| 12 | wf:796 | raw PREV issue-body GET | RETARGET via `_alert_repo()` (B2) |
+| 13 | wf:838 | mirror recovery close (`|| true`) | GATED: `|| true` removed; close failure → `::error` + `exit 1` |
+| 14 | wf:847 | mirror create (RED/SILENCE transition) | GATED: create failure → `::error` + `exit 1` (was the silent 410 of run 34917023897) |
+| 15 | wf:855 | mirror transition comment (`|| true`) | GATED: `|| true` removed → `::error` + `exit 1` |
+| 16 | wf:858-859 | mirror heartbeat dedup + comment (`|| true`) | GATED: `|| true` removed → `::error` + `exit 1` |
+| 17 | wf:896-900 | duty-health credential-dead (C1) find/create/comment | Posts GATED (create/comment failure → `::error` + `exit 1`); the C1 canary DETECTION stays a warning |
+| 18 | wf:912-916 | duty-health credential-dead (B1) find/create/comment | Posts GATED (detection stays a warning) |
+| 19 | wf:926-930 | duty-health board-sync-degraded find/create/comment | Posts GATED |
+| 20 | wf:942-946 | duty-health pinger-silent find/create/comment | Posts GATED |
+| — | NEW | fsm duty Law-3 breaker latch (find/create/comment/close) | Added per design: `duty alert: work-lane breaker (fsm)` — same gating law |
+| — | NEW | duty-health A0 alert-target canary | Authenticated `GET /user` + `GET /repos/{alert-repo}` (`has_issues`); failure → `::error` + `exit 1` — the ONE duty-health canary that fails the run |
+
+Non-sites (checked, intentionally untouched): `repos/${PRIVATE_REPO}` reads
+(roster/registry/scan/notices — the private swarm repo, not the alert lane);
+`gh run list -R "${GITHUB_REPOSITORY}"` (wf pinger liveness — run enumeration on
+the executor repo itself, not an issues-API path); `repos/${META_REPO}` reads +
+meta_note comments in the mirror duty (the private meta tracking issue — a
+different lane, warnings stay warnings); `repos/${FSM_REPO}` state/runs reads.
+
+`alert.executor_issue`: absent from this repo (grep: zero hits — it lives only
+in the private swarm repo's roster JSON, unread by code; removal there is an
+operator roster edit, outside this branch).
+
+## 3. Post-change verification
+
+(Appended after the implementation commits — see the tail of this file.)
