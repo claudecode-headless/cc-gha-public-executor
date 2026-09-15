@@ -104,3 +104,28 @@ operator roster edit, outside this branch).
 ## 3. Post-change verification
 
 (Appended after the implementation commits — see the tail of this file.)
+
+## 3. Post-change verification (appended at b7ec174 — the sweep proof)
+
+```
+$ grep -n "exec_alert_\|repos/\${GITHUB_REPOSITORY}" scripts/exec-duty-lib.sh .github/workflows/scheduler.yml | grep -c .
+47
+
+$ grep -Fn 'repos/${GITHUB_REPOSITORY}' scripts/exec-duty-lib.sh .github/workflows/scheduler.yml
+rc=1  (1 = zero matches — zero hardcoded alert targets remain; swept)
+
+$ grep -n "exec_alert_" scripts/exec-duty-lib.sh .github/workflows/scheduler.yml | grep -c .
+47
+```
+
+The 50-line pre-change inventory became 47 lines post-change (6 lib helper
+references reshaped; roster-degraded block moved into duty-health; every
+mode=on create/comment site now carries the `if ! …; then ::error + exit 1`
+gate). Zero `repos/${GITHUB_REPOSITORY}` occurrences remain in either file —
+every alert-lane path routes through `_alert_repo()` (single source, B2).
+`repos/${PRIVATE_REPO}`, `repos/${META_REPO}`, `repos/${FSM_REPO}` and the
+pinger's run enumeration are non-alert-lane calls by design (see §2 notes).
+
+Pinned in the suite: `tests/test-exec-duty-lib.sh` group 10 asserts zero
+hardcoded targets in BOTH files + the `EXEC_ALERT_REPO:` wiring — a future
+regression (a new raw call site) fails the offline suite.
