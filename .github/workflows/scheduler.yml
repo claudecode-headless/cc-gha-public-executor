@@ -92,6 +92,10 @@ jobs:
     env:
       PRIVATE_REPO: claudecode-headless/cc-gha-exploration
       GH_PAGER: ""
+      # T46-A2 alert lane (job-level env propagates to every step that
+      # sources scripts/exec-duty-lib.sh): empty → the lib default
+      # claudecode-headless/fsm-lab; 'self' → this repo (fork mode).
+      EXEC_ALERT_REPO: ${{ vars.EXEC_ALERT_REPO }}
     steps:
       # SHA-pinned (a moved v4 tag would otherwise run with no PAT but still
       # executes third-party code on this secret-holding runner)
@@ -104,6 +108,10 @@ jobs:
         # single-repo path (R3 M2 — a roster hiccup must not be a blackout).
         # Runs BEFORE the monitor scan so legacy steps can be gated on its
         # outputs; missing/empty outputs fail OPEN (legacy steps still run).
+        # T46-A2/B1: this step NEVER touches the alert lane — its degraded
+        # alert post moved to the duty-health step (an exit-1 here would skip
+        # the success()-gated monitor duties = total blackout). It therefore
+        # no longer sources exec-duty-lib.sh at all.
         id: roster
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_PRIVATE }}  # step-scoped
@@ -119,7 +127,6 @@ jobs:
           EXEC_MIRROR_HEALTH: ${{ vars.EXEC_MIRROR_HEALTH }}
         run: |
           set -uo pipefail   # deliberately NOT -e: degrade, never fail
-          . scripts/exec-duty-lib.sh
           # The fallback roster == today's behavior expressed as data (the
           # 'swarm' entry alone). Used for EXEC_DUTY_ROSTER=off AND for
           # DEGRADED mode (roster fetch/validation failure).
@@ -136,14 +143,8 @@ jobs:
               : # valid — entry count is logged after the file write (never the contents: private slugs)
             else
               mode=degraded
-              echo "::error::duty roster fetch/validation FAILED — DEGRADED mode this cycle: legacy single-repo duties ONLY (fsm-watchdog + mirror-health inert). This is a fallback, NOT a blackout. Fix: .github/roster/repos.json in the private swarm repo, or GH_PAT_PRIVATE validity."
+              echo "::error::duty roster fetch/validation FAILED — DEGRADED mode this cycle: legacy single-repo duties ONLY (fsm-watchdog + mirror-health inert). This is a fallback, NOT a blackout. Fix: .github/roster/repos.json in the private swarm repo, or GH_PAT_PRIVATE validity. (Alert post lives in the duty-health step — B1.)"
               ROSTER_JSON="$FALLBACK_ROSTER"
-              N=$(exec_alert_find "duty alert: roster degraded")
-              if [ -z "${N:-}" ]; then
-                exec_alert_create "duty alert: roster degraded" "[exec-duty] roster fetch/validation failed at $(date -u +%FT%TZ) — the executor is running DEGRADED (legacy single-repo duties only; fsm-watchdog + mirror-health inert). The roster lives at .github/roster/repos.json in the private swarm repo; check GH_PAT_PRIVATE too. One comment per day while this persists (24h dedup)." >/dev/null
-              elif exec_alert_dedup_ok "$N" 24; then
-                exec_alert_comment "$N" "[exec-duty] roster still degraded as of $(date -u +%FT%TZ) — legacy path only." || true
-              fi
             fi
           fi
           printf '%s' "$ROSTER_JSON" > /tmp/duty-roster.json
@@ -553,13 +554,17 @@ jobs:
         # always(): a duty failure upstream must never suppress another duty
         # (the existing notices/dispatch gating law). Empty mode output = no
         # roster entry (or degraded mode) = inert, never an error.
+        # T46-A2: detection failures still never fail the step, but mode=on
+        # alert POST failures DO gate RED (R2 law 5 — a due alert that could
+        # not be posted must not ride green cycles). Also carries the Law-3
+        # work-lane breaker (alert-only, ~zero cost when the lane is healthy).
         if: always() && steps.roster.outputs.mode_fsm != 'off' && steps.roster.outputs.mode_fsm != ''
         id: fsm_duty
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_PRIVATE }}  # step-scoped: only this step holds the PAT
           MODE: ${{ steps.roster.outputs.mode_fsm }}
         run: |
-          set -uo pipefail   # a duty NEVER fails the scan job
+          set -uo pipefail   # detections degrade; mode=on alert POST failures gate (R2 law 5)
           . scripts/exec-duty-lib.sh
           ENTRY=$(jq -c '[.repos[] | select(.duties["fsm-watchdog"] != null)] | first // empty' /tmp/duty-roster.json 2>/dev/null || true)
           if [ -z "${ENTRY:-}" ]; then
@@ -588,20 +593,79 @@ jobs:
 
           # ---- 1. state read (contents API; ~8KB — well inside the base64 limit) ----
           STATE=$(gh api "repos/${FSM_REPO}/contents/${STATE_PATH}?ref=${STATE_REF}" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || true)
-          STATE_OK=0; SEQ=""; AGE_MIN=""; HALTED=false; PAUSED=false
+          STATE_OK=0; SEQ=""; AGE_MIN=""; HALTED=false; PAUSED=false; TIMEOUTS=""; DONE=""
           if [ -n "${STATE:-}" ] && SEQ=$(printf '%s' "$STATE" | jq -r '.chain.seq // empty' 2>/dev/null) && [ -n "$SEQ" ]; then
             STATE_OK=1
             LAST_TICK=$(printf '%s' "$STATE" | jq -r '.chain.last_tick // empty')
             HALTED=$(printf '%s' "$STATE" | jq -r '.chain.halted // false')
             PAUSED=$(printf '%s' "$STATE" | jq -r '.chain.paused // false')
+            # Law-3 inputs (same fetch, live-verified shape: stats.timeouts
+            # counts EVENTS, stats.done counts TASKS — lib/fsm.mjs; an epoch
+            # reset zeroes both → (0,0) → hold, no false alert at genesis).
+            TIMEOUTS=$(printf '%s' "$STATE" | jq -r '.stats.timeouts // 0' 2>/dev/null || echo 0)
+            DONE=$(printf '%s' "$STATE" | jq -r '.stats.done // 0' 2>/dev/null || echo 0)
             if [ -n "$LAST_TICK" ]; then
               AGE_MIN=$(( ($(date +%s) - $(date -u -d "$LAST_TICK" +%s)) / 60 ))
             fi
           fi
 
+          # ---- 1b. Law-3 work-lane breaker (R2 law 3's executor half) -----
+          # ratio r = timeouts/(timeouts+done); alert at timeouts≥3 AND
+          # r ≥ lane_breaker_ratio (roster config, default 0.5); latch closes
+          # only at r < lane_breaker_clear_ratio (default 0.25). Runs BEFORE
+          # every dispatch-path exit (alert-only sub-duty; the latch is
+          # stateless — the OPEN issue on the alert repo). The live NTL RED
+          # blob keeps the mirror latch honest; this one catches the OTHER
+          # green-churn killer: dispatches that never become runs.
+          if [ "$STATE_OK" = "1" ]; then
+            LB_AR=$(printf '%s' "$D" | jq -r '.lane_breaker_ratio // 0.5')
+            LB_CR=$(printf '%s' "$D" | jq -r '.lane_breaker_clear_ratio // 0.25')
+            LB_V=$(lane_breaker_verdict "${TIMEOUTS}" "${DONE}" "${LB_AR}" "${LB_CR}")
+            LB_R=$(awk -v t="${TIMEOUTS:-0}" -v d="$(( ${TIMEOUTS:-0} + ${DONE:-0} ))" 'BEGIN { if (d > 0) printf "%.3f", t/d; else print "n/a" }')
+            echo "[fsm] lane breaker: timeouts=${TIMEOUTS} done=${DONE} ratio=${LB_R} verdict=${LB_V} (alert≥${LB_AR} with floor 3, clear<${LB_CR})"
+            LB_N=$(exec_alert_find "duty alert: work-lane breaker (fsm)")
+            LB_BODY="[exec-duty] work-lane breaker ${LB_V} at $(date -u +%FT%TZ) — timeouts=${TIMEOUTS} done=${DONE} ratio=${LB_R} (chain seq=${SEQ}). Lane: https://github.com/${FSM_REPO} (public). R2 law 3: dispatches that never become runs burn timeouts while everything reads green; close-on-clear re-arms this latch."
+            case "$LB_V" in
+              alert)
+                if [ "${MODE}" = "dry" ]; then
+                  if [ -z "${LB_N:-}" ]; then
+                    echo "[fsm] DRY: lane breaker ALERT — would CREATE latch 'duty alert: work-lane breaker (fsm)' (timeouts=${TIMEOUTS} done=${DONE} ratio=${LB_R} seq=${SEQ})"
+                  else
+                    echo "[fsm] DRY: lane breaker ALERT — would heartbeat latch issue #${LB_N} (24h dedup)"
+                  fi
+                elif [ -z "${LB_N:-}" ]; then
+                  if ! LB_NEW=$(exec_alert_create "duty alert: work-lane breaker (fsm)" "$LB_BODY"); then
+                    echo "::error::[fsm] lane-breaker ALERT could not be posted (latch create failed) — R2 law 5: the alert lane must not ride green cycles"
+                    exit 1
+                  fi
+                  echo "[fsm] lane breaker ALERT — opened latch issue #${LB_NEW} (timeouts=${TIMEOUTS} done=${DONE} ratio=${LB_R} seq=${SEQ})"
+                elif exec_alert_dedup_ok "${LB_N}" 24; then
+                  if ! exec_alert_comment "${LB_N}" "${LB_BODY}"; then
+                    echo "::error::[fsm] lane-breaker heartbeat on issue #${LB_N} failed — R2 law 5"
+                    exit 1
+                  fi
+                  echo "[fsm] lane breaker ALERT steady — daily heartbeat on issue #${LB_N}"
+                else
+                  echo "[fsm] lane breaker ALERT steady — heartbeat deduped (24h)"
+                fi ;;
+              clear)
+                if [ -n "${LB_N:-}" ]; then
+                  if [ "${MODE}" = "dry" ]; then
+                    echo "[fsm] DRY: lane breaker CLEAR — would comment+close latch issue #${LB_N} (re-arm)"
+                  elif ! exec_alert_close "${LB_N}" "${LB_BODY}"; then
+                    echo "::error::[fsm] lane-breaker CLEAR close on issue #${LB_N} failed — R2 law 5 (latch stuck open must be visible)"
+                    exit 1
+                  else
+                    echo "[fsm] lane breaker CLEAR — transition comment + close on issue #${LB_N} (latch re-armed)"
+                  fi
+                fi ;;
+              hold) : ;;  # hysteresis band / below the 3-timeout floor / genesis
+            esac
+          fi
+
           VERDICT=dispatch
           if [ "$STATE_OK" = "1" ]; then
-            echo "[fsm] state: seq=${SEQ} age=${AGE_MIN:-?}min stale_after=${STALE_MIN}min halted=${HALTED} paused=${PAUSED}"
+            echo "[fsm] state: seq=${SEQ} age=${AGE_MIN:-?}min stale_after=${STALE_MIN}min halted=${HALTED} paused=${PAUSED} timeouts=${TIMEOUTS} done=${DONE}"
             if [ "$HALTED" = "true" ]; then
               echo "[fsm] mode=halted — skip (chain intentionally held; zero dispatches)"
               VERDICT=halted-skip
@@ -658,12 +722,15 @@ jobs:
             if [ "$MODE" = "dry" ]; then
               echo "[fsm] DRY: soft-cap tripped (${REPRIMES} reprimes/${WINDOW_H}h ≥ ${SOFTCAP}) — would OPEN latch issue 'duty alert: fsm re-prime storm' and stop dispatching"
             else
-              LN=$(exec_alert_create "duty alert: fsm re-prime storm" "[exec-duty] ${REPRIMES} watchdog-reprime runs in the last ${WINDOW_H}h (soft-cap ${SOFTCAP}) while the chain stays stale. Executor-driven watchdog dispatches are PAUSED while this issue is open (stateless latch — close it to re-arm). The in-repo watchdog breaker remains the sole re-prime/breaker authority. Opened $(date -u +%FT%TZ).")
-              if [ -n "${LN:-}" ]; then
-                echo "[fsm] soft-cap tripped — opened latch issue #${LN}; dispatch suppressed this cycle"
-              else
-                echo "::warning::[fsm] soft-cap tripped but latch issue creation failed — suppressing dispatch this cycle anyway (conservative)"
+              # R2 law 5 (T46-A2 — this exact site was the live 410 defect of
+              # run 34917023897: the create failed, the gh error body passed as
+              # the "issue number", and the run stayed GREEN): a due latch that
+              # cannot be posted now FAILS the cycle.
+              if ! LN=$(exec_alert_create "duty alert: fsm re-prime storm" "[exec-duty] ${REPRIMES} watchdog-reprime runs in the last ${WINDOW_H}h (soft-cap ${SOFTCAP}) while the chain stays stale. Executor-driven watchdog dispatches are PAUSED while this issue is open (stateless latch — close it to re-arm). The in-repo watchdog breaker remains the sole re-prime/breaker authority. Opened $(date -u +%FT%TZ)."); then
+                echo "::error::[fsm] soft-cap tripped but the latch issue could NOT be opened — R2 law 5: due alert lost; failing the cycle instead of riding green"
+                exit 1
               fi
+              echo "[fsm] soft-cap tripped — opened latch issue #${LN}; dispatch suppressed this cycle"
             fi
             echo "- [fsm] watchdog duty: mode=${MODE} seq=${SEQ:-?} verdict=softcap-tripped" >> "$GITHUB_STEP_SUMMARY"
             exit 0
@@ -712,13 +779,15 @@ jobs:
         # Alert-only duty: zero dispatches anywhere (R1 rollout — live by
         # adjudication). The private meta slug is read into an env var from
         # the roster and NEVER logged; logs use the alias 'meta' only.
+        # T46-A2: mode=on alert POST failures gate RED (R2 law 5); detection
+        # failures (ledger/run reads) stay warnings, never false-alert.
         if: always() && steps.roster.outputs.mode_mirror != 'off' && steps.roster.outputs.mode_mirror != ''
         id: mirror_duty
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_PRIVATE }}  # step-scoped
           MODE: ${{ steps.roster.outputs.mode_mirror }}
         run: |
-          set -uo pipefail   # a duty NEVER fails the scan job
+          set -uo pipefail   # detections degrade; mode=on alert POST failures gate (R2 law 5)
           . scripts/exec-duty-lib.sh
           ENTRY=$(jq -c '[.repos[] | select(.duties["mirror-health"] != null)] | first // empty' /tmp/duty-roster.json 2>/dev/null || true)
           if [ -z "${ENTRY:-}" ]; then
@@ -789,11 +858,14 @@ jobs:
             # order-independent newest-marker (the comments API ignores
             # sort/direction server-side — W2-b law 20): sort_by created_at
             # INSIDE jq, take last; never trust per_page ordering.
-            PREV=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_N}/comments?per_page=20" 2>/dev/null \
+            # T46-A2/B2: these two raw reads retarget to the alert repo via
+            # _alert_repo() — a wrong-repo PREV read would misfire comments
+            # (and dedup) on unrelated issues.
+            PREV=$(GH_TOKEN="$(_alert_token)" gh api "repos/$(_alert_repo)/issues/${ISSUE_N}/comments?per_page=20" 2>/dev/null \
               | jq -r '[.[] | select((.body // "") | startswith("[exec-duty]"))] | sort_by(.created_at) | last | .body // empty' 2>/dev/null \
               | grep -o 'verdict: [A-Z]*' | tail -1 | awk '{print $2}' || true)
             if [ -z "${PREV:-}" ]; then
-              PREV=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_N}" --jq '.body // ""' 2>/dev/null \
+              PREV=$(GH_TOKEN="$(_alert_token)" gh api "repos/$(_alert_repo)/issues/${ISSUE_N}" --jq '.body // ""' 2>/dev/null \
                 | grep -o 'verdict: [A-Z]*' | head -1 | awk '{print $2}' || true)
             fi
             [ -n "${PREV:-}" ] || PREV=unknown
@@ -835,7 +907,12 @@ jobs:
           case "$VERDICT" in
             GREEN)
               if [ -n "${ISSUE_N:-}" ]; then
-                exec_alert_close "${ISSUE_N}" "$(alert_body GREEN)" || true
+                # R2 law 5: the recovery close is a latch-mutating post — a
+                # failure gates RED (a stuck-open latch must be visible).
+                if ! exec_alert_close "${ISSUE_N}" "$(alert_body GREEN)"; then
+                  echo "::error::[meta] recovery close on alert issue #${ISSUE_N} failed — R2 law 5: the alert lane must not ride green cycles"
+                  exit 1
+                fi
                 echo "[meta] verdict GREEN with an open alert issue — recovery comment + close (self-healing latch)"
                 meta_note "${PREV}->GREEN"
               else
@@ -844,19 +921,26 @@ jobs:
             RED|SILENCE)
               BODY=$(alert_body "$VERDICT")
               if [ -z "${ISSUE_N:-}" ]; then
-                AN=$(exec_alert_create "duty alert: mirror-health" "$BODY")
-                if [ -n "${AN:-}" ]; then
-                  echo "[meta] verdict ${VERDICT} — opened exec-duty-alert issue #${AN}"
-                  meta_note "GREEN->${VERDICT}"
-                else
-                  echo "::warning::[meta] alert issue creation failed (issues disabled?) — verdict logged only"
+                # R2 law 5 (T46-A2 — the live 410 defect class: a due alert
+                # that cannot be posted must not ride green cycles).
+                if ! AN=$(exec_alert_create "duty alert: mirror-health" "$BODY"); then
+                  echo "::error::[meta] alert issue creation FAILED (verdict ${VERDICT}) — R2 law 5: due alert could not be posted"
+                  exit 1
                 fi
+                echo "[meta] verdict ${VERDICT} — opened exec-duty-alert issue #${AN}"
+                meta_note "GREEN->${VERDICT}"
               elif [ "${PREV}" != "$VERDICT" ]; then
-                exec_alert_comment "${ISSUE_N}" "$BODY" || true
+                if ! exec_alert_comment "${ISSUE_N}" "$BODY"; then
+                  echo "::error::[meta] transition comment on alert issue #${ISSUE_N} failed — R2 law 5"
+                  exit 1
+                fi
                 echo "[meta] verdict transition ${PREV}->${VERDICT} — commented alert issue #${ISSUE_N}"
                 meta_note "${PREV}->${VERDICT}"
               elif exec_alert_dedup_ok "${ISSUE_N}" 24; then
-                exec_alert_comment "${ISSUE_N}" "$BODY" || true
+                if ! exec_alert_comment "${ISSUE_N}" "$BODY"; then
+                  echo "::error::[meta] heartbeat comment on alert issue #${ISSUE_N} failed — R2 law 5"
+                  exit 1
+                fi
                 echo "[meta] verdict ${VERDICT} steady — daily heartbeat comment on issue #${ISSUE_N}"
               else
                 echo "[meta] verdict ${VERDICT} steady — heartbeat comment deduped (24h)"
@@ -865,39 +949,86 @@ jobs:
           echo "- [meta] mirror-health duty: mode=${MODE} verdict=${VERDICT} (ts_age=${TS_AGE_H}h, streak=${STREAK})" >> "$GITHUB_STEP_SUMMARY"
           exit 0
 
-      - name: Duty health (credential canaries — never fails the run)
+      - name: Duty health (A0 alert-target canary + credential canaries)
         # The electronic half of the PAT-expiry probe (design §5.3): the
         # #1 silent killer (token death — the GL_PAT 9-day outage class)
-        # becomes a ≤1-cycle WARNING + alert issue. Canary failure is a
-        # WARNING by adjudication, never a job failure.
+        # becomes a ≤1-cycle WARNING + alert issue. T46-A2 amendment:
+        # A0 (the alert-target canary, FIRST below) is the ONE duty-health
+        # canary whose failure FAILS the run — a dead alert lane must not
+        # ride green cycles (R2 law 5 post-dates the P1-B 'canaries never
+        # fail' adjudication and governs). Canary DETECTIONS (C1/B1/
+        # board-skip/pinger) stay warnings; every due alert POST failure also
+        # gates RED per law 5. This step also owns the roster-degraded alert
+        # post (moved from the roster step — B1: that step runs before the
+        # success()-gated monitor duties and must never fail or alert).
         if: always()
         id: duty_health
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_PRIVATE }}  # step-scoped
           BOARD_PAT: ${{ secrets.BOARD_PAT }}       # optional project-scoped token
           EXEC_PINGER: ${{ vars.EXEC_PINGER }}
+          ROSTER_MODE: ${{ steps.roster.outputs.roster_mode }}
+          EXEC_PAT_EXPIRY_HINT: ${{ vars.EXEC_PAT_EXPIRY_HINT }}  # dated hint line until the PAT-ledger duty (W-C)
         run: |
           set -uo pipefail
           . scripts/exec-duty-lib.sh
+
+          # ---- A0: alert-target canary (FIRST; the ONE duty-health red) ----
+          # Authenticated GET /user proves the TOKEN class (an anonymous-readable
+          # /repos probe cannot — M2); GET /repos/{alert-repo} + has_issues
+          # proves the TARGET (issues-disabled repos 410 on create — the live
+          # T46-A2 defect). Both must hold or alerts CANNOT post → red.
+          A0_U=$(curl -sS -o /tmp/dh-a0-user.json -D /tmp/dh-a0-user.hdr -w '%{http_code}' --max-time 30 \
+            -H "Authorization: token $(_alert_token)" https://api.github.com/user 2>/dev/null || echo 000)
+          A0_R=$(curl -sS -o /tmp/dh-a0-repo.json -w '%{http_code}' --max-time 30 \
+            -H "Authorization: token $(_alert_token)" "https://api.github.com/repos/$(_alert_repo)" 2>/dev/null || echo 000)
+          A0_LOGIN=$(jq -r '.login // empty' /tmp/dh-a0-user.json 2>/dev/null || true)
+          A0_ISSUES=$(jq -r '.has_issues // empty' /tmp/dh-a0-repo.json 2>/dev/null || true)
+          A0_SCOPES=$(sed -n 's/^[Xx]-[Oo]auth-[Ss]copes:[[:space:]]*//p' /tmp/dh-a0-user.hdr 2>/dev/null | tr -d '\r' | head -1)
+          if [ "${A0_U}" = "200" ] && [ -n "${A0_LOGIN}" ] && [ "${A0_R}" = "200" ] && [ "${A0_ISSUES}" = "true" ]; then
+            echo "duty-health: A0 alert target OK — repo=$(_alert_repo) has_issues=true; token login=${A0_LOGIN}, scopes: ${A0_SCOPES:-unknown}"
+            if [ -n "${EXEC_PAT_EXPIRY_HINT:-}" ]; then
+              echo "duty-health: A0 expiry hint: ${EXEC_PAT_EXPIRY_HINT} (dated hint only — the PAT-ledger duty is the durable answer, W-C)"
+            fi
+          else
+            echo "::error::duty-health: A0 alert target broken (user HTTP ${A0_U}, repo HTTP ${A0_R}, has_issues=${A0_ISSUES:-?}, login=${A0_LOGIN:-none}, target $(_alert_repo)) — alerts CANNOT post; failing the run per R2 law 5"
+            exit 1
+          fi
 
           # ---- C1: GH_PAT_PRIVATE (registry/roster reads, dispatches, mirror reads) ----
           C1_CODE=$(curl -sS -o /tmp/dh-c1.json -D /tmp/dh-c1.hdr -w '%{http_code}' --max-time 30 \
             -H "Authorization: token ${GH_TOKEN}" https://api.github.com/user 2>/dev/null || echo 000)
           if [ "${C1_CODE}" = "200" ]; then
             C1_SCOPES=$(sed -n 's/^[Xx]-[Oo]auth-[Ss]copes:[[:space:]]*//p' /tmp/dh-c1.hdr | tr -d '\r' | head -1)
+            # C6/T46-A2: x-oauth-scopes is comma-SPACE separated — the old
+            # bare grep for ',workflow,' never matched ', workflow,' (the
+            # comma-space bug). Normalize with tr BEFORE the subset check.
+            C1_NORM=$(printf '%s' "${C1_SCOPES:-}" | tr -d ' \r')
             echo "duty-health: C1 (GH_PAT_PRIVATE) canary OK — scopes: ${C1_SCOPES:-unknown}"
-            if ! printf ',%s,' "${C1_SCOPES:-}" | grep -q ',repo,' || ! printf ',%s,' "${C1_SCOPES:-}" | grep -q ',workflow,'; then
+            if ! printf ',%s,' "$C1_NORM" | grep -q ',repo,' || ! printf ',%s,' "$C1_NORM" | grep -q ',workflow,'; then
               # scope-narrowing rotation breaks duties silently — inline the
               # pat-scope-audit per cycle instead of a one-off workflow
               echo "::warning::duty-health: C1 scope drift — expected 'repo, workflow', got '${C1_SCOPES:-none}' (roster/registry reads + watchdog dispatch will start failing)"
+            fi
+            # M3: normalization alone would hide the TRUE positive (the live
+            # org-admin god-PAT). Over-scope = warning only — the operator's
+            # god-PAT posture is known and accepted.
+            if printf '%s' "${C1_NORM:-}" | tr ',' '\n' | grep -q '^admin:'; then
+              echo "::warning::duty-health: C1 over-scope — admin:* scope present ('${C1_SCOPES}'): rotation candidate — see pat-scope-audit lineage"
             fi
           else
             echo "::warning::duty-health: C1 (GH_PAT_PRIVATE) canary FAILED (HTTP ${C1_CODE}) — WARNING by design, not a failure: the legacy scan already aborts loudly on a dead PAT; duties are blind until rotation"
             N=$(exec_alert_find "duty alert: credential dead (C1)")
             if [ -z "${N:-}" ]; then
-              exec_alert_create "duty alert: credential dead (C1)" "[exec-duty] GH_PAT_PRIVATE canary failed (HTTP ${C1_CODE}) at $(date -u +%FT%TZ) — all private-repo reads and dispatches are dead. Rotate the secret. One comment/day while dead (24h dedup); close this issue when fixed." >/dev/null
+              if ! exec_alert_create "duty alert: credential dead (C1)" "[exec-duty] GH_PAT_PRIVATE canary failed (HTTP ${C1_CODE}) at $(date -u +%FT%TZ) — all private-repo reads and dispatches are dead. Rotate the secret. One comment/day while dead (24h dedup); close this issue when fixed." >/dev/null; then
+                echo "::error::duty-health: credential-dead (C1) alert creation FAILED — R2 law 5: due alert could not be posted"
+                exit 1
+              fi
             elif exec_alert_dedup_ok "$N" 24; then
-              exec_alert_comment "$N" "[exec-duty] GH_PAT_PRIVATE still dead as of $(date -u +%FT%TZ) (canary HTTP ${C1_CODE})." || true
+              if ! exec_alert_comment "$N" "[exec-duty] GH_PAT_PRIVATE still dead as of $(date -u +%FT%TZ) (canary HTTP ${C1_CODE})."; then
+                echo "::error::duty-health: credential-dead (C1) alert comment FAILED — R2 law 5"
+                exit 1
+              fi
             fi
           fi
 
@@ -911,9 +1042,15 @@ jobs:
               echo "::warning::duty-health: B1 (BOARD_PAT) canary FAILED (HTTP ${B1_CODE}) — board-sync degrades silently (its graceful-skip keeps the scheduler green)"
               N=$(exec_alert_find "duty alert: credential dead (B1)")
               if [ -z "${N:-}" ]; then
-                exec_alert_create "duty alert: credential dead (B1)" "[exec-duty] BOARD_PAT canary failed (HTTP ${B1_CODE}) at $(date -u +%FT%TZ) — board-sync is silently degrading to skip. Rotate the secret." >/dev/null
+                if ! exec_alert_create "duty alert: credential dead (B1)" "[exec-duty] BOARD_PAT canary failed (HTTP ${B1_CODE}) at $(date -u +%FT%TZ) — board-sync is silently degrading to skip. Rotate the secret." >/dev/null; then
+                  echo "::error::duty-health: credential-dead (B1) alert creation FAILED — R2 law 5"
+                  exit 1
+                fi
               elif exec_alert_dedup_ok "$N" 24; then
-                exec_alert_comment "$N" "[exec-duty] BOARD_PAT still dead as of $(date -u +%FT%TZ) (canary HTTP ${B1_CODE})." || true
+                if ! exec_alert_comment "$N" "[exec-duty] BOARD_PAT still dead as of $(date -u +%FT%TZ) (canary HTTP ${B1_CODE})."; then
+                  echo "::error::duty-health: credential-dead (B1) alert comment FAILED — R2 law 5"
+                  exit 1
+                fi
               fi
             fi
           else
@@ -925,9 +1062,36 @@ jobs:
             echo "::warning::duty-health: board-sync SKIPPED this cycle (capability: token lacks project scope) — alerting with 24h dedup"
             N=$(exec_alert_find "duty alert: board-sync degraded")
             if [ -z "${N:-}" ]; then
-              exec_alert_create "duty alert: board-sync degraded" "[exec-duty] board-sync gracefully skipped at $(date -u +%FT%TZ) — the token in play lacks the project scope (INSUFFICIENT_SCOPES). The board will silently go stale; add/rotate BOARD_PAT." >/dev/null
+              if ! exec_alert_create "duty alert: board-sync degraded" "[exec-duty] board-sync gracefully skipped at $(date -u +%FT%TZ) — the token in play lacks the project scope (INSUFFICIENT_SCOPES). The board will silently go stale; add/rotate BOARD_PAT." >/dev/null; then
+                echo "::error::duty-health: board-sync-degraded alert creation FAILED — R2 law 5"
+                exit 1
+              fi
             elif exec_alert_dedup_ok "$N" 24; then
-              exec_alert_comment "$N" "[exec-duty] board-sync still skipping as of $(date -u +%FT%TZ)." || true
+              if ! exec_alert_comment "$N" "[exec-duty] board-sync still skipping as of $(date -u +%FT%TZ)."; then
+                echo "::error::duty-health: board-sync-degraded alert comment FAILED — R2 law 5"
+                exit 1
+              fi
+            fi
+          fi
+
+          # ---- roster-degraded alert (MOVED from the roster step — B1) ----
+          # The roster step must NEVER fail: it runs BEFORE the success()-
+          # gated monitor duties (scan/board/quota), so an exit-1 there is a
+          # total monitoring blackout (the R3-M2 forbidden class). The alert
+          # post rides this always() step instead, same 24h dedup as before.
+          if [ "${ROSTER_MODE:-}" = "degraded" ]; then
+            echo "::warning::duty-health: duty roster fetch/validation FAILED this cycle (roster step degraded) — alerting with 24h dedup"
+            N=$(exec_alert_find "duty alert: roster degraded")
+            if [ -z "${N:-}" ]; then
+              if ! exec_alert_create "duty alert: roster degraded" "[exec-duty] roster fetch/validation failed at $(date -u +%FT%TZ) — the executor is running DEGRADED (legacy single-repo duties only; fsm-watchdog + mirror-health inert). The roster lives at .github/roster/repos.json in the private swarm repo; check GH_PAT_PRIVATE too. One comment per day while this persists (24h dedup)." >/dev/null; then
+                echo "::error::duty-health: roster-degraded alert creation FAILED — R2 law 5: due alert could not be posted"
+                exit 1
+              fi
+            elif exec_alert_dedup_ok "$N" 24; then
+              if ! exec_alert_comment "$N" "[exec-duty] roster still degraded as of $(date -u +%FT%TZ) — legacy path only."; then
+                echo "::error::duty-health: roster-degraded alert comment FAILED — R2 law 5"
+                exit 1
+              fi
             fi
           fi
 
@@ -941,9 +1105,15 @@ jobs:
               echo "::warning::duty-health: pinger lane SILENT — no repository_dispatch runs in 3h while EXEC_PINGER=on (the de-correlated wake source is down; native cadence is the floor)"
               N=$(exec_alert_find "duty alert: pinger silent")
               if [ -z "${N:-}" ]; then
-                exec_alert_create "duty alert: pinger silent" "[exec-duty] no repository_dispatch (cron-ping) runs in the last 3h while EXEC_PINGER=on — the external pinger is down (provider job paused? PAT expired?). Native schedule is the current floor." >/dev/null
+                if ! exec_alert_create "duty alert: pinger silent" "[exec-duty] no repository_dispatch (cron-ping) runs in the last 3h while EXEC_PINGER=on — the external pinger is down (provider job paused? PAT expired?). Native schedule is the current floor." >/dev/null; then
+                  echo "::error::duty-health: pinger-silent alert creation FAILED — R2 law 5"
+                  exit 1
+                fi
               elif exec_alert_dedup_ok "$N" 24; then
-                exec_alert_comment "$N" "[exec-duty] pinger still silent as of $(date -u +%FT%TZ)." || true
+                if ! exec_alert_comment "$N" "[exec-duty] pinger still silent as of $(date -u +%FT%TZ)."; then
+                  echo "::error::duty-health: pinger-silent alert comment FAILED — R2 law 5"
+                  exit 1
+                fi
               fi
             else
               echo "duty-health: pinger lane alive (${PIN} ping run(s) in 3h)"
