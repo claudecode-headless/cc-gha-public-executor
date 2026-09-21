@@ -125,6 +125,7 @@ jobs:
           EXEC_QUOTA_TELEMETRY: ${{ vars.EXEC_QUOTA_TELEMETRY }}
           EXEC_FSM_WATCHDOG: ${{ vars.EXEC_FSM_WATCHDOG }}
           EXEC_MIRROR_HEALTH: ${{ vars.EXEC_MIRROR_HEALTH }}
+          EXEC_PINGER_WATCH: ${{ vars.EXEC_PINGER_WATCH }}
         run: |
           set -uo pipefail   # deliberately NOT -e: degrade, never fail
           # The fallback roster == today's behavior expressed as data (the
@@ -187,6 +188,7 @@ jobs:
           QUOTA=$(resolve_mode "$(duty_state quota-telemetry)" "${EXEC_QUOTA_TELEMETRY:-}" 0)
           FSMW=$(resolve_mode "$(duty_state fsm-watchdog)" "${EXEC_FSM_WATCHDOG:-}" 1)
           MIRR=$(resolve_mode "$(duty_state mirror-health)" "${EXEC_MIRROR_HEALTH:-}" 1)
+          PINGW=$(resolve_mode "$(duty_state pinger-watch)" "${EXEC_PINGER_WATCH:-}" 1)
           {
             echo "mode_stall_scan=${STALL}"
             echo "mode_failure_watch=${FWATCH}"
@@ -194,10 +196,11 @@ jobs:
             echo "mode_quota=${QUOTA}"
             echo "mode_fsm=${FSMW}"
             echo "mode_mirror=${MIRR}"
+            echo "mode_pinger_watch=${PINGW}"
             echo "roster_mode=${mode}"
           } >> "$GITHUB_OUTPUT"
-          echo "duty modes: stall-scan=${STALL} failure-watch=${FWATCH} board-sync=${BSYNC} quota=${QUOTA} fsm-watchdog=${FSMW} mirror-health=${MIRR} (roster=${mode})"
-          echo "- duty roster: ${mode} — stall-scan=${STALL}, failure-watch=${FWATCH}, board-sync=${BSYNC}, quota=${QUOTA}, fsm-watchdog=${FSMW}, mirror-health=${MIRR}" >> "$GITHUB_STEP_SUMMARY"
+          echo "duty modes: stall-scan=${STALL} failure-watch=${FWATCH} board-sync=${BSYNC} quota=${QUOTA} fsm-watchdog=${FSMW} mirror-health=${MIRR} pinger-watch=${PINGW} (roster=${mode})"
+          echo "- duty roster: ${mode} — stall-scan=${STALL}, failure-watch=${FWATCH}, board-sync=${BSYNC}, quota=${QUOTA}, fsm-watchdog=${FSMW}, mirror-health=${MIRR}, pinger-watch=${PINGW}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Monitor scan (stalls + failed turns + board state)
         # Roster-gated but fail-OPEN: missing/empty mode outputs (roster step
@@ -947,6 +950,100 @@ jobs:
               fi ;;
           esac
           echo "- [meta] mirror-health duty: mode=${MODE} verdict=${VERDICT} (ts_age=${TS_AGE_H}h, streak=${STREAK})" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Watch-the-watcher duty (pinger liveness + watchdog deadman)
+        # T46/W-C3 duty 8 (s21): the de-correlated watch plane for the FSM's
+        # own watchers. Canonical spec: fsm-lab lib/pinger-watch.mjs — the
+        # pinger window RECALIBRATED to the measured live cadence (300min;
+        # the 45min nominal-cron constant false-alarmed on the 2h-4h07 real
+        # gaps) and the watchdog DEADMAN (180min; the healthy-path scan
+        # leaves a journal heartbeat, but runs are the executor-visible
+        # half). RUNS-SOURCED by design (the spec's blessed secondary
+        # source): every pinger dispatch fires a conductor run even on a
+        # held chain (the quiesce path), and the watchdog's own runs ARE
+        # the deadman signal — the dumb driver never parses fsm-state
+        # internals. Alert-only (zero dispatches); 24h-deduped latch issues;
+        # detection failures degrade (warnings), mode=on alert POST failures
+        # gate RED (R2 law 5); dry mode logs the verdicts only.
+        if: always() && steps.roster.outputs.mode_pinger_watch != 'off' && steps.roster.outputs.mode_pinger_watch != ''
+        id: pinger_duty
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_PRIVATE }}  # step-scoped: only this step holds the PAT
+          MODE: ${{ steps.roster.outputs.mode_pinger_watch }}
+        run: |
+          set -uo pipefail   # detections degrade; mode=on alert POST failures gate (R2 law 5)
+          . scripts/exec-duty-lib.sh
+          ENTRY=$(jq -c '[.repos[] | select(.duties["pinger-watch"] != null)] | first // empty' /tmp/duty-roster.json 2>/dev/null || true)
+          if [ -z "${ENTRY:-}" ]; then
+            echo "[pinger-watch] no pinger-watch entry in the roster — duty inert this cycle"
+            exit 0
+          fi
+          FSM_REPO=$(printf '%s' "$ENTRY" | jq -r '.repo')
+          D=$(printf '%s' "$ENTRY" | jq -c '.duties["pinger-watch"]')
+          P_STALE=$(printf '%s' "$D" | jq -r '.stale_after_min // 300')
+          W_STALE=$(printf '%s' "$D" | jq -r '.watchdog_stale_after_min // 180')
+          CWF=$(printf '%s' "$D" | jq -r '.conductor_workflow // "conductor.yml"')
+          WDWf=$(printf '%s' "$D" | jq -r '.watchdog_workflow // "watchdog.yml"')
+
+          # ---- source 1: the pinger's conductor runs (title-prefixed "pinger ·") ----
+          PRUNS=$(gh run list -R "${FSM_REPO}" --workflow "${CWF}" --limit 40 --json displayTitle,createdAt 2>/dev/null || echo '[]')
+          PNEWEST=$(printf '%s' "$PRUNS" | jq -r '[.[] | select((.displayTitle // "") | startswith("pinger ·"))] | map(.createdAt) | max // empty' 2>/dev/null || true)
+          # ---- source 2: the watchdog's own runs (the deadman) ----
+          WRUNS=$(gh run list -R "${FSM_REPO}" --workflow "${WDWf}" --limit 10 --json createdAt 2>/dev/null || echo '[]')
+          WNEWEST=$(printf '%s' "$WRUNS" | jq -r 'map(.createdAt) | max // empty' 2>/dev/null || true)
+
+          age_min() { # <iso> — empty arg echoes "none"
+            [ -n "${1:-}" ] || { echo none; return 0; }
+            date -u -d "$1" +%s 2>/dev/null | { read -r t; [ -n "${t:-}" ] && echo $(( ($(date +%s) - t) / 60 )) || echo none; }
+          }
+          PAGE_MIN=$(age_min "${PNEWEST:-}")
+          WAGE_MIN=$(age_min "${WNEWEST:-}")
+
+          # ---- verdicts: no runs at all = STALE (fail-loud; a fresh repo with
+          # zero pinger runs should alarm until the pinger fires once) ----
+          P_VERDICT=fresh
+          if [ -z "${PNEWEST:-}" ] || [ "${PAGE_MIN:-none}" = "none" ]; then P_VERDICT=silent
+          elif [ "${PAGE_MIN}" -gt "${P_STALE}" ]; then P_VERDICT=silent; fi
+          W_VERDICT=fresh
+          if [ -z "${WNEWEST:-}" ] || [ "${WAGE_MIN:-none}" = "none" ]; then W_VERDICT=silent
+          elif [ "${WAGE_MIN}" -gt "${W_STALE}" ]; then W_VERDICT=silent; fi
+
+          echo "[pinger-watch] pinger: newest=${PNEWEST:-NONE} age=${PAGE_MIN}min (stale>${P_STALE}) -> ${P_VERDICT} | watchdog: newest=${WNEWEST:-NONE} age=${WAGE_MIN}min (stale>${W_STALE}) -> ${W_VERDICT}"
+
+          post_verdict() { # <slug> <title> <body>
+            local slug="$1" title="$2" body="$3" N
+            if [ "${MODE}" = "dry" ]; then
+              echo "[pinger-watch] DRY: ${slug} — would post/heartbeat '${title}'"
+              return 0
+            fi
+            N=$(exec_alert_find "${title}")
+            if [ -z "${N:-}" ]; then
+              if ! exec_alert_create "${title}" "${body}" >/dev/null; then
+                echo "::error::[pinger-watch] ${slug} alert creation FAILED — R2 law 5"
+                exit 1
+              fi
+              echo "[pinger-watch] ${slug} alert CREATED"
+            elif exec_alert_dedup_ok "$N" 24; then
+              if ! exec_alert_comment "$N" "${body}"; then
+                echo "::error::[pinger-watch] ${slug} alert comment FAILED — R2 law 5"
+                exit 1
+              fi
+              echo "[pinger-watch] ${slug} alert heartbeated on #${N} (24h dedup)"
+            else
+              echo "[pinger-watch] ${slug} alert deduped on #${N}"
+            fi
+          }
+
+          if [ "${P_VERDICT}" = "silent" ]; then
+            post_verdict "pinger-silent" "duty alert: pinger silent (fsm)" \
+              "[exec-duty] watch-the-watcher: the FSM pinger is SILENT — no 'pinger ·' conductor run on ${FSM_REPO} within ${P_STALE}min (newest: ${PNEWEST:-none}, age ${PAGE_MIN}min). The de-correlated heartbeat of last resort is down (xfnwfpho1/pinger: PAT expiry? workflow disabled? account issue?). Native schedule is the current floor; the chain may still self-tick — check ${FSM_REPO} conductor runs before intervening."
+          fi
+          if [ "${W_VERDICT}" = "silent" ]; then
+            post_verdict "watchdog-deadman" "duty alert: watchdog deadman (fsm)" \
+              "[exec-duty] watch-the-watcher: the FSM WATCHDOG is silent — no ${WDWf} run on ${FSM_REPO} within ${W_STALE}min (newest: ${WNEWEST:-none}, age ${WAGE_MIN}min). The safety net that re-primes dead chains and detects stalls is itself down (workflow disabled? schedule starvation? org incident?). The journal heartbeat markers (watchdog-scan-<ms>) are the in-repo half of this verdict."
+          fi
+          echo "- pinger-watch duty: mode=${MODE} pinger=${P_VERDICT} (age ${PAGE_MIN}min / ${P_STALE}) watchdog=${W_VERDICT} (age ${WAGE_MIN}min / ${W_STALE})" >> "$GITHUB_STEP_SUMMARY"
           exit 0
 
       - name: Duty health (A0 alert-target canary + credential canaries)
