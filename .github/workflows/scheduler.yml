@@ -957,7 +957,12 @@ jobs:
         # own watchers. Canonical spec: fsm-lab lib/pinger-watch.mjs — the
         # pinger window RECALIBRATED to the measured live cadence (300min;
         # the 45min nominal-cron constant false-alarmed on the 2h-4h07 real
-        # gaps) and the watchdog DEADMAN (180min; the healthy-path scan
+        # gaps) and the watchdog DEADMAN (300min as of s22/R2-1 — the same
+        # measured-cadence logic: the watchdog's sibling-run gaps ALSO run
+        # 2h-4h07, so the s21 180min default false-alarmed a healthy chain;
+        # the roster's watchdog_stale_after_min now carries 300 and remains
+        # the source of truth — this driver reads it, never hardcodes it).
+        # The healthy-path scan
         # leaves a journal heartbeat, but runs are the executor-visible
         # half). RUNS-SOURCED by design (the spec's blessed secondary
         # source): every pinger dispatch fires a conductor run even on a
