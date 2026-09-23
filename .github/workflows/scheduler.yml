@@ -620,7 +620,13 @@ jobs:
           # stateless — the OPEN issue on the alert repo). The live NTL RED
           # blob keeps the mirror latch honest; this one catches the OTHER
           # green-churn killer: dispatches that never become runs.
-          if [ "$STATE_OK" = "1" ]; then
+          # s23 gate (the issue-#24 live catch): a HALTED or PAUSED chain
+          # cannot churn — its stats are the epoch's FINAL record (the
+          # drill's hang night reads done=0 timeouts=3 BY DESIGN and would
+          # page on every stage-0 night; the completion digest already
+          # carries the degraded verdict). The breaker watches LIVE churn
+          # only; an open latch stays the operator's close action.
+          if [ "$STATE_OK" = "1" ] && [ "$HALTED" != "true" ] && [ "$PAUSED" != "true" ]; then
             LB_AR=$(printf '%s' "$D" | jq -r '.lane_breaker_ratio // 0.5')
             LB_CR=$(printf '%s' "$D" | jq -r '.lane_breaker_clear_ratio // 0.25')
             LB_V=$(lane_breaker_verdict "${TIMEOUTS}" "${DONE}" "${LB_AR}" "${LB_CR}")
